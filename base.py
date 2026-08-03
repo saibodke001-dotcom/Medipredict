@@ -1,1524 +1,3053 @@
-# pool/base.py
+# dialects/sqlite/base.py
 # Copyright (C) 2005-2026 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
+# mypy: ignore-errors
 
 
-"""Base constructs for connection pools."""
+r'''
+.. dialect:: sqlite
+    :name: SQLite
+    :normal_support: 3.12+
+    :best_effort: 3.7.16+
+
+.. _sqlite_datetime:
+
+Date and Time Types
+-------------------
+
+SQLite does not have built-in DATE, TIME, or DATETIME types, and pysqlite does
+not provide out of the box functionality for translating values between Python
+`datetime` objects and a SQLite-supported format. SQLAlchemy's own
+:class:`~sqlalchemy.types.DateTime` and related types provide date formatting
+and parsing functionality when SQLite is used. The implementation classes are
+:class:`_sqlite.DATETIME`, :class:`_sqlite.DATE` and :class:`_sqlite.TIME`.
+These types represent dates and times as ISO formatted strings, which also
+nicely support ordering. There's no reliance on typical "libc" internals for
+these functions so historical dates are fully supported.
+
+Ensuring Text affinity
+^^^^^^^^^^^^^^^^^^^^^^
+
+The DDL rendered for these types is the standard ``DATE``, ``TIME``
+and ``DATETIME`` indicators.    However, custom storage formats can also be
+applied to these types.   When the
+storage format is detected as containing no alpha characters, the DDL for
+these types is rendered as ``DATE_CHAR``, ``TIME_CHAR``, and ``DATETIME_CHAR``,
+so that the column continues to have textual affinity.
+
+.. seealso::
+
+    `Type Affinity <https://www.sqlite.org/datatype3.html#affinity>`_ -
+    in the SQLite documentation
+
+.. _sqlite_autoincrement:
+
+SQLite Auto Incrementing Behavior
+----------------------------------
+
+Background on SQLite's autoincrement is at: https://sqlite.org/autoinc.html
+
+Key concepts:
+
+* SQLite has an implicit "auto increment" feature that takes place for any
+  non-composite primary-key column that is specifically created using
+  "INTEGER PRIMARY KEY" for the type + primary key.
+
+* SQLite also has an explicit "AUTOINCREMENT" keyword, that is **not**
+  equivalent to the implicit autoincrement feature; this keyword is not
+  recommended for general use.  SQLAlchemy does not render this keyword
+  unless a special SQLite-specific directive is used (see below).  However,
+  it still requires that the column's type is named "INTEGER".
+
+Using the AUTOINCREMENT Keyword
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+To specifically render the AUTOINCREMENT keyword on the primary key column
+when rendering DDL, add the flag ``sqlite_autoincrement=True`` to the Table
+construct::
+
+    Table(
+        "sometable",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        sqlite_autoincrement=True,
+    )
+
+Allowing autoincrement behavior SQLAlchemy types other than Integer/INTEGER
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SQLite's typing model is based on naming conventions.  Among other things, this
+means that any type name which contains the substring ``"INT"`` will be
+determined to be of "integer affinity".  A type named ``"BIGINT"``,
+``"SPECIAL_INT"`` or even ``"XYZINTQPR"``, will be considered by SQLite to be
+of "integer" affinity.  However, **the SQLite autoincrement feature, whether
+implicitly or explicitly enabled, requires that the name of the column's type
+is exactly the string "INTEGER"**.  Therefore, if an application uses a type
+like :class:`.BigInteger` for a primary key, on SQLite this type will need to
+be rendered as the name ``"INTEGER"`` when emitting the initial ``CREATE
+TABLE`` statement in order for the autoincrement behavior to be available.
+
+One approach to achieve this is to use :class:`.Integer` on SQLite
+only using :meth:`.TypeEngine.with_variant`::
+
+    table = Table(
+        "my_table",
+        metadata,
+        Column(
+            "id",
+            BigInteger().with_variant(Integer, "sqlite"),
+            primary_key=True,
+        ),
+    )
+
+Another is to use a subclass of :class:`.BigInteger` that overrides its DDL
+name to be ``INTEGER`` when compiled against SQLite::
+
+    from sqlalchemy import BigInteger
+    from sqlalchemy.ext.compiler import compiles
+
+
+    class SLBigInteger(BigInteger):
+        pass
+
+
+    @compiles(SLBigInteger, "sqlite")
+    def bi_c(element, compiler, **kw):
+        return "INTEGER"
+
+
+    @compiles(SLBigInteger)
+    def bi_c(element, compiler, **kw):
+        return compiler.visit_BIGINT(element, **kw)
+
+
+    table = Table(
+        "my_table", metadata, Column("id", SLBigInteger(), primary_key=True)
+    )
+
+.. seealso::
+
+    :meth:`.TypeEngine.with_variant`
+
+    :ref:`sqlalchemy.ext.compiler_toplevel`
+
+    `Datatypes In SQLite Version 3 <https://sqlite.org/datatype3.html>`_
+
+.. _sqlite_transactions:
+
+Transactions with SQLite and the sqlite3 driver
+-----------------------------------------------
+
+As a file-based database, SQLite's approach to transactions differs from
+traditional databases in many ways.  Additionally, the ``sqlite3`` driver
+standard with Python (as well as the async version ``aiosqlite`` which builds
+on top of it) has several quirks, workarounds, and API features in the
+area of transaction control, all of which generally need to be addressed when
+constructing a SQLAlchemy application that uses SQLite.
+
+Legacy Transaction Mode with the sqlite3 driver
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The most important aspect of transaction handling with the sqlite3 driver is
+that it defaults (which will continue through Python 3.15 before being
+removed in Python 3.16) to legacy transactional behavior which does
+not strictly follow :pep:`249`.  The way in which the driver diverges from the
+PEP is that it does not "begin" a transaction automatically as dictated by
+:pep:`249` except in the case of DML statements, e.g. INSERT, UPDATE, and
+DELETE.   Normally, :pep:`249` dictates that a BEGIN must be emitted upon
+the first SQL statement of any kind, so that all subsequent operations will
+be established within a transaction until ``connection.commit()`` has been
+called.   The ``sqlite3`` driver, in an effort to be easier to use in
+highly concurrent environments, skips this step for DQL (e.g. SELECT) statements,
+and also skips it for DDL (e.g. CREATE TABLE etc.) statements for more legacy
+reasons.  Statements such as SAVEPOINT are also skipped.
+
+In modern versions of the ``sqlite3`` driver as of Python 3.12, this legacy
+mode of operation is referred to as
+`"legacy transaction control" <https://docs.python.org/3/library/sqlite3.html#sqlite3-transaction-control-isolation-level>`_, and is in
+effect by default due to the ``Connection.autocommit`` parameter being set to
+the constant ``sqlite3.LEGACY_TRANSACTION_CONTROL``.  Prior to Python 3.12,
+the ``Connection.autocommit`` attribute did not exist.
+
+The implications of legacy transaction mode include:
+
+* **Incorrect support for transactional DDL** - statements like CREATE TABLE, ALTER TABLE,
+  CREATE INDEX etc. will not automatically BEGIN a transaction if one were not
+  started already, leading to the changes by each statement being
+  "autocommitted" immediately unless BEGIN were otherwise emitted first.   Very
+  old (pre Python 3.6) versions of SQLite would also force a COMMIT for these
+  operations even if a transaction were present, however this is no longer the
+  case.
+* **SERIALIZABLE behavior not fully functional** - SQLite's transaction isolation
+  behavior is normally consistent with SERIALIZABLE isolation, as it is a file-
+  based system that locks the database file entirely for write operations,
+  preventing COMMIT until all reader transactions (and associated file locks)
+  have completed.  However, sqlite3's legacy transaction mode fails to emit BEGIN for SELECT
+  statements, which causes these SELECT statements to no longer be "repeatable",
+  failing one of the consistency guarantees of SERIALIZABLE.
+* **Incorrect behavior for SAVEPOINT** - as the SAVEPOINT statement does not
+  imply a BEGIN, a new SAVEPOINT emitted before a BEGIN will function on its
+  own but fails to participate in the enclosing transaction, meaning a ROLLBACK
+  of the transaction will not rollback elements that were part of a released
+  savepoint.
+
+Legacy transaction mode first existed in order to facilitate working around
+SQLite's file locks.  Because SQLite relies upon whole-file locks, it is easy to
+get "database is locked" errors, particularly when newer features like "write
+ahead logging" are disabled.   This is a key reason why ``sqlite3``'s legacy
+transaction mode is still the default mode of operation; disabling it will
+produce behavior that is more susceptible to locked database errors.  However
+note that **legacy transaction mode will no longer be the default** in a future
+Python version (3.16 as of this writing).
+
+.. _sqlite_enabling_transactions:
+
+Enabling Non-Legacy SQLite Transactional Modes with the sqlite3 or aiosqlite driver
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Current SQLAlchemy support allows either for setting the
+``.Connection.autocommit`` attribute, most directly by using a
+:func:`._sa.create_engine` parameter, or if on an older version of Python where
+the attribute is not available, using event hooks to control the behavior of
+BEGIN.
+
+* **Enabling modern sqlite3 transaction control via the autocommit connect parameter** (Python 3.12 and above)
+
+  To use SQLite in the mode described at `Transaction control via the autocommit attribute <https://docs.python.org/3/library/sqlite3.html#transaction-control-via-the-autocommit-attribute>`_,
+  the most straightforward approach is to set the attribute to its recommended value
+  of ``False`` at the connect level using :paramref:`_sa.create_engine.connect_args``::
+
+    from sqlalchemy import create_engine
+
+    engine = create_engine(
+        "sqlite:///myfile.db", connect_args={"autocommit": False}
+    )
+
+  This parameter is also passed through when using the aiosqlite driver::
+
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine(
+        "sqlite+aiosqlite:///myfile.db", connect_args={"autocommit": False}
+    )
+
+  The parameter can also be set at the attribute level using the :meth:`.PoolEvents.connect`
+  event hook, however this will only work for sqlite3, as aiosqlite does not yet expose this
+  attribute on its ``Connection`` object::
+
+    from sqlalchemy import create_engine, event
+
+    engine = create_engine("sqlite:///myfile.db")
+
+
+    @event.listens_for(engine, "connect")
+    def do_connect(dbapi_connection, connection_record):
+        # enable autocommit=False mode
+        dbapi_connection.autocommit = False
+
+* **Using SQLAlchemy to emit BEGIN in lieu of SQLite's transaction control** (all Python versions, sqlite3 and aiosqlite)
+
+  For older versions of ``sqlite3`` or for cross-compatibility with older and
+  newer versions, SQLAlchemy can also take over the job of transaction control.
+  This is achieved by using the :meth:`.ConnectionEvents.begin` hook
+  to emit the "BEGIN" command directly, while also disabling SQLite's control
+  of this command using the :meth:`.PoolEvents.connect` event hook to set the
+  ``Connection.isolation_level`` attribute to ``None``::
+
+
+    from sqlalchemy import create_engine, event
+
+    engine = create_engine("sqlite:///myfile.db")
+
+
+    @event.listens_for(engine, "connect")
+    def do_connect(dbapi_connection, connection_record):
+        # disable sqlite3's emitting of the BEGIN statement entirely.
+        dbapi_connection.isolation_level = None
+
+
+    @event.listens_for(engine, "begin")
+    def do_begin(conn):
+        # emit our own BEGIN.   sqlite3 still emits COMMIT/ROLLBACK correctly
+        conn.exec_driver_sql("BEGIN")
+
+  When using the asyncio variant ``aiosqlite``, refer to ``engine.sync_engine``
+  as in the example below::
+
+    from sqlalchemy import create_engine, event
+    from sqlalchemy.ext.asyncio import create_async_engine
+
+    engine = create_async_engine("sqlite+aiosqlite:///myfile.db")
+
+
+    @event.listens_for(engine.sync_engine, "connect")
+    def do_connect(dbapi_connection, connection_record):
+        # disable aiosqlite's emitting of the BEGIN statement entirely.
+        dbapi_connection.isolation_level = None
+
+
+    @event.listens_for(engine.sync_engine, "begin")
+    def do_begin(conn):
+        # emit our own BEGIN.  aiosqlite still emits COMMIT/ROLLBACK correctly
+        conn.exec_driver_sql("BEGIN")
+
+.. _sqlite_isolation_level:
+
+Using SQLAlchemy's Driver Level AUTOCOMMIT Feature with SQLite
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+SQLAlchemy has a comprehensive database isolation feature with optional
+autocommit support that is introduced in the section :ref:`dbapi_autocommit`.
+
+For the ``sqlite3`` and ``aiosqlite`` drivers, SQLAlchemy only includes
+built-in support for "AUTOCOMMIT".    Note that this mode is currently incompatible
+with the non-legacy isolation mode hooks documented in the previous
+section at :ref:`sqlite_enabling_transactions`.
+
+To use the ``sqlite3`` driver with SQLAlchemy driver-level autocommit,
+create an engine setting the :paramref:`_sa.create_engine.isolation_level`
+parameter to "AUTOCOMMIT"::
+
+    eng = create_engine("sqlite:///myfile.db", isolation_level="AUTOCOMMIT")
+
+When using the above mode, any event hooks that set the sqlite3 ``Connection.autocommit``
+parameter away from its default of ``sqlite3.LEGACY_TRANSACTION_CONTROL``
+as well as hooks that emit ``BEGIN`` should be disabled.
+
+Additional Reading for SQLite / sqlite3 transaction control
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Links with important information on SQLite, the sqlite3 driver,
+as well as long historical conversations on how things got to their current state:
+
+* `Isolation in SQLite <https://www.sqlite.org/isolation.html>`_ - on the SQLite website
+* `Transaction control <https://docs.python.org/3/library/sqlite3.html#transaction-control>`_ - describes the sqlite3 autocommit attribute as well
+  as the legacy isolation_level attribute.
+* `sqlite3 SELECT does not BEGIN a transaction, but should according to spec <https://github.com/python/cpython/issues/54133>`_ - imported Python standard library issue on github
+* `sqlite3 module breaks transactions and potentially corrupts data <https://github.com/python/cpython/issues/54949>`_ - imported Python standard library issue on github
+
+
+INSERT/UPDATE/DELETE...RETURNING
+---------------------------------
+
+The SQLite dialect supports SQLite 3.35's  ``INSERT|UPDATE|DELETE..RETURNING``
+syntax.   ``INSERT..RETURNING`` may be used
+automatically in some cases in order to fetch newly generated identifiers in
+place of the traditional approach of using ``cursor.lastrowid``, however
+``cursor.lastrowid`` is currently still preferred for simple single-statement
+cases for its better performance.
+
+To specify an explicit ``RETURNING`` clause, use the
+:meth:`._UpdateBase.returning` method on a per-statement basis::
+
+    # INSERT..RETURNING
+    result = connection.execute(
+        table.insert().values(name="foo").returning(table.c.col1, table.c.col2)
+    )
+    print(result.all())
+
+    # UPDATE..RETURNING
+    result = connection.execute(
+        table.update()
+        .where(table.c.name == "foo")
+        .values(name="bar")
+        .returning(table.c.col1, table.c.col2)
+    )
+    print(result.all())
+
+    # DELETE..RETURNING
+    result = connection.execute(
+        table.delete()
+        .where(table.c.name == "foo")
+        .returning(table.c.col1, table.c.col2)
+    )
+    print(result.all())
+
+.. versionadded:: 2.0  Added support for SQLite RETURNING
+
+
+.. _sqlite_foreign_keys:
+
+Foreign Key Support
+-------------------
+
+SQLite supports FOREIGN KEY syntax when emitting CREATE statements for tables,
+however by default these constraints have no effect on the operation of the
+table.
+
+Constraint checking on SQLite has three prerequisites:
+
+* At least version 3.6.19 of SQLite must be in use
+* The SQLite library must be compiled *without* the SQLITE_OMIT_FOREIGN_KEY
+  or SQLITE_OMIT_TRIGGER symbols enabled.
+* The ``PRAGMA foreign_keys = ON`` statement must be emitted on all
+  connections before use -- including the initial call to
+  :meth:`sqlalchemy.schema.MetaData.create_all`.
+
+SQLAlchemy allows for the ``PRAGMA`` statement to be emitted automatically for
+new connections through the usage of events::
+
+    from sqlalchemy.engine import Engine
+    from sqlalchemy import event
+
+
+    @event.listens_for(Engine, "connect")
+    def set_sqlite_pragma(dbapi_connection, connection_record):
+        # the sqlite3 driver will not set PRAGMA foreign_keys
+        # if autocommit=False; set to True temporarily
+        ac = dbapi_connection.autocommit
+        dbapi_connection.autocommit = True
+
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+        # restore previous autocommit setting
+        dbapi_connection.autocommit = ac
+
+.. warning::
+
+    When SQLite foreign keys are enabled, it is **not possible**
+    to emit CREATE or DROP statements for tables that contain
+    mutually-dependent foreign key constraints;
+    to emit the DDL for these tables requires that ALTER TABLE be used to
+    create or drop these constraints separately, for which SQLite has
+    no support.
+
+.. seealso::
+
+    `SQLite Foreign Key Support <https://www.sqlite.org/foreignkeys.html>`_
+    - on the SQLite web site.
+
+    :ref:`event_toplevel` - SQLAlchemy event API.
+
+    :ref:`use_alter` - more information on SQLAlchemy's facilities for handling
+     mutually-dependent foreign key constraints.
+
+.. _sqlite_on_conflict_ddl:
+
+ON CONFLICT support for constraints
+-----------------------------------
+
+.. seealso:: This section describes the :term:`DDL` version of "ON CONFLICT" for
+   SQLite, which occurs within a CREATE TABLE statement.  For "ON CONFLICT" as
+   applied to an INSERT statement, see :ref:`sqlite_on_conflict_insert`.
+
+SQLite supports a non-standard DDL clause known as ON CONFLICT which can be applied
+to primary key, unique, check, and not null constraints.   In DDL, it is
+rendered either within the "CONSTRAINT" clause or within the column definition
+itself depending on the location of the target constraint.    To render this
+clause within DDL, the extension parameter ``sqlite_on_conflict`` can be
+specified with a string conflict resolution algorithm within the
+:class:`.PrimaryKeyConstraint`, :class:`.UniqueConstraint`,
+:class:`.CheckConstraint` objects.  Within the :class:`_schema.Column` object,
+there
+are individual parameters ``sqlite_on_conflict_not_null``,
+``sqlite_on_conflict_primary_key``, ``sqlite_on_conflict_unique`` which each
+correspond to the three types of relevant constraint types that can be
+indicated from a :class:`_schema.Column` object.
+
+.. seealso::
+
+    `ON CONFLICT <https://www.sqlite.org/lang_conflict.html>`_ - in the SQLite
+    documentation
+
+.. versionadded:: 1.3
+
+
+The ``sqlite_on_conflict`` parameters accept a  string argument which is just
+the resolution name to be chosen, which on SQLite can be one of ROLLBACK,
+ABORT, FAIL, IGNORE, and REPLACE.   For example, to add a UNIQUE constraint
+that specifies the IGNORE algorithm::
+
+    some_table = Table(
+        "some_table",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column("data", Integer),
+        UniqueConstraint("id", "data", sqlite_on_conflict="IGNORE"),
+    )
+
+The above renders CREATE TABLE DDL as:
+
+.. sourcecode:: sql
+
+    CREATE TABLE some_table (
+        id INTEGER NOT NULL,
+        data INTEGER,
+        PRIMARY KEY (id),
+        UNIQUE (id, data) ON CONFLICT IGNORE
+    )
+
+
+When using the :paramref:`_schema.Column.unique`
+flag to add a UNIQUE constraint
+to a single column, the ``sqlite_on_conflict_unique`` parameter can
+be added to the :class:`_schema.Column` as well, which will be added to the
+UNIQUE constraint in the DDL::
+
+    some_table = Table(
+        "some_table",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "data", Integer, unique=True, sqlite_on_conflict_unique="IGNORE"
+        ),
+    )
+
+rendering:
+
+.. sourcecode:: sql
+
+    CREATE TABLE some_table (
+        id INTEGER NOT NULL,
+        data INTEGER,
+        PRIMARY KEY (id),
+        UNIQUE (data) ON CONFLICT IGNORE
+    )
+
+To apply the FAIL algorithm for a NOT NULL constraint,
+``sqlite_on_conflict_not_null`` is used::
+
+    some_table = Table(
+        "some_table",
+        metadata,
+        Column("id", Integer, primary_key=True),
+        Column(
+            "data", Integer, nullable=False, sqlite_on_conflict_not_null="FAIL"
+        ),
+    )
+
+this renders the column inline ON CONFLICT phrase:
+
+.. sourcecode:: sql
+
+    CREATE TABLE some_table (
+        id INTEGER NOT NULL,
+        data INTEGER NOT NULL ON CONFLICT FAIL,
+        PRIMARY KEY (id)
+    )
+
+
+Similarly, for an inline primary key, use ``sqlite_on_conflict_primary_key``::
+
+    some_table = Table(
+        "some_table",
+        metadata,
+        Column(
+            "id",
+            Integer,
+            primary_key=True,
+            sqlite_on_conflict_primary_key="FAIL",
+        ),
+    )
+
+SQLAlchemy renders the PRIMARY KEY constraint separately, so the conflict
+resolution algorithm is applied to the constraint itself:
+
+.. sourcecode:: sql
+
+    CREATE TABLE some_table (
+        id INTEGER NOT NULL,
+        PRIMARY KEY (id) ON CONFLICT FAIL
+    )
+
+.. _sqlite_on_conflict_insert:
+
+INSERT...ON CONFLICT (Upsert)
+-----------------------------
+
+.. seealso:: This section describes the :term:`DML` version of "ON CONFLICT" for
+   SQLite, which occurs within an INSERT statement.  For "ON CONFLICT" as
+   applied to a CREATE TABLE statement, see :ref:`sqlite_on_conflict_ddl`.
+
+From version 3.24.0 onwards, SQLite supports "upserts" (update or insert)
+of rows into a table via the ``ON CONFLICT`` clause of the ``INSERT``
+statement. A candidate row will only be inserted if that row does not violate
+any unique or primary key constraints. In the case of a unique constraint violation, a
+secondary action can occur which can be either "DO UPDATE", indicating that
+the data in the target row should be updated, or "DO NOTHING", which indicates
+to silently skip this row.
+
+Conflicts are determined using columns that are part of existing unique
+constraints and indexes.  These constraints are identified by stating the
+columns and conditions that comprise the indexes.
+
+SQLAlchemy provides ``ON CONFLICT`` support via the SQLite-specific
+:func:`_sqlite.insert()` function, which provides
+the generative methods :meth:`_sqlite.Insert.on_conflict_do_update`
+and :meth:`_sqlite.Insert.on_conflict_do_nothing`:
+
+.. sourcecode:: pycon+sql
+
+    >>> from sqlalchemy.dialects.sqlite import insert
+
+    >>> insert_stmt = insert(my_table).values(
+    ...     id="some_existing_id", data="inserted value"
+    ... )
+
+    >>> do_update_stmt = insert_stmt.on_conflict_do_update(
+    ...     index_elements=["id"], set_=dict(data="updated value")
+    ... )
+
+    >>> print(do_update_stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?{stop}
+
+    >>> do_nothing_stmt = insert_stmt.on_conflict_do_nothing(index_elements=["id"])
+
+    >>> print(do_nothing_stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?)
+    ON CONFLICT (id) DO NOTHING
+
+.. versionadded:: 1.4
+
+.. seealso::
+
+    `Upsert
+    <https://sqlite.org/lang_UPSERT.html>`_
+    - in the SQLite documentation.
+
+
+Specifying the Target
+^^^^^^^^^^^^^^^^^^^^^
+
+Both methods supply the "target" of the conflict using column inference:
+
+* The :paramref:`_sqlite.Insert.on_conflict_do_update.index_elements` argument
+  specifies a sequence containing string column names, :class:`_schema.Column`
+  objects, and/or SQL expression elements, which would identify a unique index
+  or unique constraint.
+
+* When using :paramref:`_sqlite.Insert.on_conflict_do_update.index_elements`
+  to infer an index, a partial index can be inferred by also specifying the
+  :paramref:`_sqlite.Insert.on_conflict_do_update.index_where` parameter:
+
+  .. sourcecode:: pycon+sql
+
+        >>> stmt = insert(my_table).values(user_email="a@b.com", data="inserted data")
+
+        >>> do_update_stmt = stmt.on_conflict_do_update(
+        ...     index_elements=[my_table.c.user_email],
+        ...     index_where=my_table.c.user_email.like("%@gmail.com"),
+        ...     set_=dict(data=stmt.excluded.data),
+        ... )
+
+        >>> print(do_update_stmt)
+        {printsql}INSERT INTO my_table (data, user_email) VALUES (?, ?)
+        ON CONFLICT (user_email)
+        WHERE user_email LIKE '%@gmail.com'
+        DO UPDATE SET data = excluded.data
+
+The SET Clause
+^^^^^^^^^^^^^^^
+
+``ON CONFLICT...DO UPDATE`` is used to perform an update of the already
+existing row, using any combination of new values as well as values
+from the proposed insertion. These values are specified using the
+:paramref:`_sqlite.Insert.on_conflict_do_update.set_` parameter.  This
+parameter accepts a dictionary which consists of direct values
+for UPDATE:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(id="some_id", data="inserted value")
+
+    >>> do_update_stmt = stmt.on_conflict_do_update(
+    ...     index_elements=["id"], set_=dict(data="updated value")
+    ... )
+
+    >>> print(do_update_stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?
+
+.. warning::
+
+    The :meth:`_sqlite.Insert.on_conflict_do_update` method does **not** take
+    into account Python-side default UPDATE values or generation functions,
+    e.g. those specified using :paramref:`_schema.Column.onupdate`. These
+    values will not be exercised for an ON CONFLICT style of UPDATE, unless
+    they are manually specified in the
+    :paramref:`_sqlite.Insert.on_conflict_do_update.set_` dictionary.
+
+Updating using the Excluded INSERT Values
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+In order to refer to the proposed insertion row, the special alias
+:attr:`~.sqlite.Insert.excluded` is available as an attribute on
+the :class:`_sqlite.Insert` object; this object creates an "excluded." prefix
+on a column, that informs the DO UPDATE to update the row with the value that
+would have been inserted had the constraint not failed:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(
+    ...     id="some_id", data="inserted value", author="jlh"
+    ... )
+
+    >>> do_update_stmt = stmt.on_conflict_do_update(
+    ...     index_elements=["id"],
+    ...     set_=dict(data="updated value", author=stmt.excluded.author),
+    ... )
+
+    >>> print(do_update_stmt)
+    {printsql}INSERT INTO my_table (id, data, author) VALUES (?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?, author = excluded.author
+
+Additional WHERE Criteria
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The :meth:`_sqlite.Insert.on_conflict_do_update` method also accepts
+a WHERE clause using the :paramref:`_sqlite.Insert.on_conflict_do_update.where`
+parameter, which will limit those rows which receive an UPDATE:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(
+    ...     id="some_id", data="inserted value", author="jlh"
+    ... )
+
+    >>> on_update_stmt = stmt.on_conflict_do_update(
+    ...     index_elements=["id"],
+    ...     set_=dict(data="updated value", author=stmt.excluded.author),
+    ...     where=(my_table.c.status == 2),
+    ... )
+    >>> print(on_update_stmt)
+    {printsql}INSERT INTO my_table (id, data, author) VALUES (?, ?, ?)
+    ON CONFLICT (id) DO UPDATE SET data = ?, author = excluded.author
+    WHERE my_table.status = ?
+
+
+Skipping Rows with DO NOTHING
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+``ON CONFLICT`` may be used to skip inserting a row entirely
+if any conflict with a unique constraint occurs; below this is illustrated
+using the :meth:`_sqlite.Insert.on_conflict_do_nothing` method:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(id="some_id", data="inserted value")
+    >>> stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
+    >>> print(stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?) ON CONFLICT (id) DO NOTHING
+
+
+If ``DO NOTHING`` is used without specifying any columns or constraint,
+it has the effect of skipping the INSERT for any unique violation which
+occurs:
+
+.. sourcecode:: pycon+sql
+
+    >>> stmt = insert(my_table).values(id="some_id", data="inserted value")
+    >>> stmt = stmt.on_conflict_do_nothing()
+    >>> print(stmt)
+    {printsql}INSERT INTO my_table (id, data) VALUES (?, ?) ON CONFLICT DO NOTHING
+
+.. _sqlite_type_reflection:
+
+Type Reflection
+---------------
+
+SQLite types are unlike those of most other database backends, in that
+the string name of the type usually does not correspond to a "type" in a
+one-to-one fashion.  Instead, SQLite links per-column typing behavior
+to one of five so-called "type affinities" based on a string matching
+pattern for the type.
+
+SQLAlchemy's reflection process, when inspecting types, uses a simple
+lookup table to link the keywords returned to provided SQLAlchemy types.
+This lookup table is present within the SQLite dialect as it is for all
+other dialects.  However, the SQLite dialect has a different "fallback"
+routine for when a particular type name is not located in the lookup map;
+it instead implements the SQLite "type affinity" scheme located at
+https://www.sqlite.org/datatype3.html section 2.1.
+
+The provided typemap will make direct associations from an exact string
+name match for the following types:
+
+:class:`_types.BIGINT`, :class:`_types.BLOB`,
+:class:`_types.BOOLEAN`, :class:`_types.BOOLEAN`,
+:class:`_types.CHAR`, :class:`_types.DATE`,
+:class:`_types.DATETIME`, :class:`_types.FLOAT`,
+:class:`_types.DECIMAL`, :class:`_types.FLOAT`,
+:class:`_types.INTEGER`, :class:`_types.INTEGER`,
+:class:`_types.NUMERIC`, :class:`_types.REAL`,
+:class:`_types.SMALLINT`, :class:`_types.TEXT`,
+:class:`_types.TIME`, :class:`_types.TIMESTAMP`,
+:class:`_types.VARCHAR`, :class:`_types.NVARCHAR`,
+:class:`_types.NCHAR`
+
+When a type name does not match one of the above types, the "type affinity"
+lookup is used instead:
+
+* :class:`_types.INTEGER` is returned if the type name includes the
+  string ``INT``
+* :class:`_types.TEXT` is returned if the type name includes the
+  string ``CHAR``, ``CLOB`` or ``TEXT``
+* :class:`_types.NullType` is returned if the type name includes the
+  string ``BLOB``
+* :class:`_types.REAL` is returned if the type name includes the string
+  ``REAL``, ``FLOA`` or ``DOUB``.
+* Otherwise, the :class:`_types.NUMERIC` type is used.
+
+.. _sqlite_partial_index:
+
+Partial Indexes
+---------------
+
+A partial index, e.g. one which uses a WHERE clause, can be specified
+with the DDL system using the argument ``sqlite_where``::
+
+    tbl = Table("testtbl", m, Column("data", Integer))
+    idx = Index(
+        "test_idx1",
+        tbl.c.data,
+        sqlite_where=and_(tbl.c.data > 5, tbl.c.data < 10),
+    )
+
+The index will be rendered at create time as:
+
+.. sourcecode:: sql
+
+    CREATE INDEX test_idx1 ON testtbl (data)
+    WHERE data > 5 AND data < 10
+
+.. _sqlite_dotted_column_names:
+
+Dotted Column Names
+-------------------
+
+Using table or column names that explicitly have periods in them is
+**not recommended**.   While this is generally a bad idea for relational
+databases in general, as the dot is a syntactically significant character,
+the SQLite driver up until version **3.10.0** of SQLite has a bug which
+requires that SQLAlchemy filter out these dots in result sets.
+
+The bug, entirely outside of SQLAlchemy, can be illustrated thusly::
+
+    import sqlite3
+
+    assert sqlite3.sqlite_version_info < (
+        3,
+        10,
+        0,
+    ), "bug is fixed in this version"
+
+    conn = sqlite3.connect(":memory:")
+    cursor = conn.cursor()
+
+    cursor.execute("create table x (a integer, b integer)")
+    cursor.execute("insert into x (a, b) values (1, 1)")
+    cursor.execute("insert into x (a, b) values (2, 2)")
+
+    cursor.execute("select x.a, x.b from x")
+    assert [c[0] for c in cursor.description] == ["a", "b"]
+
+    cursor.execute("""
+        select x.a, x.b from x where a=1
+        union
+        select x.a, x.b from x where a=2
+        """)
+    assert [c[0] for c in cursor.description] == ["a", "b"], [
+        c[0] for c in cursor.description
+    ]
+
+The second assertion fails:
+
+.. sourcecode:: text
+
+    Traceback (most recent call last):
+      File "test.py", line 19, in <module>
+        [c[0] for c in cursor.description]
+    AssertionError: ['x.a', 'x.b']
+
+Where above, the driver incorrectly reports the names of the columns
+including the name of the table, which is entirely inconsistent vs.
+when the UNION is not present.
+
+SQLAlchemy relies upon column names being predictable in how they match
+to the original statement, so the SQLAlchemy dialect has no choice but
+to filter these out::
+
+
+    from sqlalchemy import create_engine
+
+    eng = create_engine("sqlite://")
+    conn = eng.connect()
+
+    conn.exec_driver_sql("create table x (a integer, b integer)")
+    conn.exec_driver_sql("insert into x (a, b) values (1, 1)")
+    conn.exec_driver_sql("insert into x (a, b) values (2, 2)")
+
+    result = conn.exec_driver_sql("select x.a, x.b from x")
+    assert result.keys() == ["a", "b"]
+
+    result = conn.exec_driver_sql("""
+        select x.a, x.b from x where a=1
+        union
+        select x.a, x.b from x where a=2
+        """)
+    assert result.keys() == ["a", "b"]
+
+Note that above, even though SQLAlchemy filters out the dots, *both
+names are still addressable*::
+
+    >>> row = result.first()
+    >>> row["a"]
+    1
+    >>> row["x.a"]
+    1
+    >>> row["b"]
+    1
+    >>> row["x.b"]
+    1
+
+Therefore, the workaround applied by SQLAlchemy only impacts
+:meth:`_engine.CursorResult.keys` and :meth:`.Row.keys()` in the public API. In
+the very specific case where an application is forced to use column names that
+contain dots, and the functionality of :meth:`_engine.CursorResult.keys` and
+:meth:`.Row.keys()` is required to return these dotted names unmodified,
+the ``sqlite_raw_colnames`` execution option may be provided, either on a
+per-:class:`_engine.Connection` basis::
+
+    result = conn.execution_options(sqlite_raw_colnames=True).exec_driver_sql(
+        """
+        select x.a, x.b from x where a=1
+        union
+        select x.a, x.b from x where a=2
+        """
+    )
+    assert result.keys() == ["x.a", "x.b"]
+
+or on a per-:class:`_engine.Engine` basis::
+
+    engine = create_engine(
+        "sqlite://", execution_options={"sqlite_raw_colnames": True}
+    )
+
+When using the per-:class:`_engine.Engine` execution option, note that
+**Core and ORM queries that use UNION may not function properly**.
+
+SQLite-specific table options
+-----------------------------
+
+One option for CREATE TABLE is supported directly by the SQLite
+dialect in conjunction with the :class:`_schema.Table` construct:
+
+* ``WITHOUT ROWID``::
+
+    Table("some_table", metadata, ..., sqlite_with_rowid=False)
+
+*
+  ``STRICT``::
+
+    Table("some_table", metadata, ..., sqlite_strict=True)
+
+  .. versionadded:: 2.0.37
+
+.. seealso::
+
+    `SQLite CREATE TABLE options
+    <https://www.sqlite.org/lang_createtable.html>`_
+
+.. _sqlite_include_internal:
+
+Reflecting internal schema tables
+----------------------------------
+
+Reflection methods that return lists of tables will omit so-called
+"SQLite internal schema object" names, which are considered by SQLite
+as any object name that is prefixed with ``sqlite_``.  An example of
+such an object is the ``sqlite_sequence`` table that's generated when
+the ``AUTOINCREMENT`` column parameter is used.   In order to return
+these objects, the parameter ``sqlite_include_internal=True`` may be
+passed to methods such as :meth:`_schema.MetaData.reflect` or
+:meth:`.Inspector.get_table_names`.
+
+.. versionadded:: 2.0  Added the ``sqlite_include_internal=True`` parameter.
+   Previously, these tables were not ignored by SQLAlchemy reflection
+   methods.
+
+.. note::
+
+    The ``sqlite_include_internal`` parameter does not refer to the
+    "system" tables that are present in schemas such as ``sqlite_master``.
+
+.. seealso::
+
+    `SQLite Internal Schema Objects <https://www.sqlite.org/fileformat2.html#intschema>`_ - in the SQLite
+    documentation.
+
+'''  # noqa
 
 from __future__ import annotations
 
-from collections import deque
-import dataclasses
-from enum import Enum
-import threading
-import time
-import typing
+import datetime
+import numbers
+import re
 from typing import Any
 from typing import Callable
-from typing import cast
-from typing import Deque
-from typing import Dict
-from typing import List
 from typing import Optional
-from typing import Tuple
 from typing import TYPE_CHECKING
-from typing import Union
-import weakref
 
-from .. import event
-from .. import exc
-from .. import log
-from .. import util
-from ..util.typing import Literal
-from ..util.typing import Protocol
-from ..util.typing import Self
+from .json import JSON
+from .json import JSONIndexType
+from .json import JSONPathType
+from ... import exc
+from ... import schema as sa_schema
+from ... import sql
+from ... import text
+from ... import types as sqltypes
+from ... import util
+from ...engine import default
+from ...engine import processors
+from ...engine import reflection
+from ...engine.reflection import ReflectionDefaults
+from ...sql import coercions
+from ...sql import compiler
+from ...sql import elements
+from ...sql import roles
+from ...sql import schema
+from ...types import BLOB  # noqa
+from ...types import BOOLEAN  # noqa
+from ...types import CHAR  # noqa
+from ...types import DECIMAL  # noqa
+from ...types import FLOAT  # noqa
+from ...types import INTEGER  # noqa
+from ...types import NUMERIC  # noqa
+from ...types import REAL  # noqa
+from ...types import SMALLINT  # noqa
+from ...types import TEXT  # noqa
+from ...types import TIMESTAMP  # noqa
+from ...types import VARCHAR  # noqa
 
 if TYPE_CHECKING:
-    from ..engine.interfaces import DBAPIConnection
-    from ..engine.interfaces import DBAPICursor
-    from ..engine.interfaces import Dialect
-    from ..event import _DispatchCommon
-    from ..event import _ListenerFnType
-    from ..event import dispatcher
-    from ..sql._typing import _InfoType
+    from ...engine.interfaces import DBAPIConnection
+    from ...engine.interfaces import Dialect
+    from ...engine.interfaces import IsolationLevel
+    from ...sql.type_api import _BindProcessorType
+    from ...sql.type_api import _ResultProcessorType
 
 
-@dataclasses.dataclass(frozen=True)
-class PoolResetState:
-    """describes the state of a DBAPI connection as it is being passed to
-    the :meth:`.PoolEvents.reset` connection pool event.
+class _SQliteJson(JSON):
+    def result_processor(self, dialect, coltype):
+        default_processor = super().result_processor(dialect, coltype)
 
-    .. versionadded:: 2.0.0b3
-
-    """
-
-    __slots__ = ("transaction_was_reset", "terminate_only", "asyncio_safe")
-
-    transaction_was_reset: bool
-    """Indicates if the transaction on the DBAPI connection was already
-    essentially "reset" back by the :class:`.Connection` object.
-
-    This boolean is True if the :class:`.Connection` had transactional
-    state present upon it, which was then not closed using the
-    :meth:`.Connection.rollback` or :meth:`.Connection.commit` method;
-    instead, the transaction was closed inline within the
-    :meth:`.Connection.close` method so is guaranteed to remain non-present
-    when this event is reached.
-
-    """
-
-    terminate_only: bool
-    """indicates if the connection is to be immediately terminated and
-    not checked in to the pool.
-
-    This occurs for connections that were invalidated, as well as asyncio
-    connections that were not cleanly handled by the calling code that
-    are instead being garbage collected.   In the latter case,
-    operations can't be safely run on asyncio connections within garbage
-    collection as there is not necessarily an event loop present.
-
-    """
-
-    asyncio_safe: bool
-    """Indicates if the reset operation is occurring within a scope where
-    an enclosing event loop is expected to be present for asyncio applications.
-
-    Will be False in the case that the connection is being garbage collected.
-
-    """
-
-
-class ResetStyle(Enum):
-    """Describe options for "reset on return" behaviors."""
-
-    reset_rollback = 0
-    reset_commit = 1
-    reset_none = 2
-
-
-_ResetStyleArgType = Union[
-    ResetStyle,
-    Literal[True, None, False, "commit", "rollback"],
-]
-reset_rollback, reset_commit, reset_none = list(ResetStyle)
-
-
-class _ConnDialect:
-    """partial implementation of :class:`.Dialect`
-    which provides DBAPI connection methods.
-
-    When a :class:`_pool.Pool` is combined with an :class:`_engine.Engine`,
-    the :class:`_engine.Engine` replaces this with its own
-    :class:`.Dialect`.
-
-    """
-
-    is_async = False
-    has_terminate = False
-
-    def do_rollback(self, dbapi_connection: PoolProxiedConnection) -> None:
-        dbapi_connection.rollback()
-
-    def do_commit(self, dbapi_connection: PoolProxiedConnection) -> None:
-        dbapi_connection.commit()
-
-    def do_terminate(self, dbapi_connection: DBAPIConnection) -> None:
-        dbapi_connection.close()
-
-    def do_close(self, dbapi_connection: DBAPIConnection) -> None:
-        dbapi_connection.close()
-
-    def _do_ping_w_event(self, dbapi_connection: DBAPIConnection) -> bool:
-        raise NotImplementedError(
-            "The ping feature requires that a dialect is "
-            "passed to the connection pool."
-        )
-
-    def get_driver_connection(self, connection: DBAPIConnection) -> Any:
-        return connection
-
-
-class _AsyncConnDialect(_ConnDialect):
-    is_async = True
-
-
-class _CreatorFnType(Protocol):
-    def __call__(self) -> DBAPIConnection: ...
-
-
-class _CreatorWRecFnType(Protocol):
-    def __call__(self, rec: ConnectionPoolEntry) -> DBAPIConnection: ...
-
-
-class Pool(log.Identified, event.EventTarget):
-    """Abstract base class for connection pools."""
-
-    dispatch: dispatcher[Pool]
-    echo: log._EchoFlagType
-
-    _orig_logging_name: Optional[str]
-    _dialect: Union[_ConnDialect, Dialect] = _ConnDialect()
-    _creator_arg: Union[_CreatorFnType, _CreatorWRecFnType]
-    _invoke_creator: _CreatorWRecFnType
-    _invalidate_time: float
-
-    def __init__(
-        self,
-        creator: Union[_CreatorFnType, _CreatorWRecFnType],
-        recycle: int = -1,
-        echo: log._EchoFlagType = None,
-        logging_name: Optional[str] = None,
-        reset_on_return: _ResetStyleArgType = True,
-        events: Optional[List[Tuple[_ListenerFnType, str]]] = None,
-        dialect: Optional[Union[_ConnDialect, Dialect]] = None,
-        pre_ping: bool = False,
-        _dispatch: Optional[_DispatchCommon[Pool]] = None,
-    ):
-        """
-        Construct a Pool.
-
-        :param creator: a callable function that returns a DB-API
-          connection object.  The function will be called with
-          parameters.
-
-        :param recycle: If set to a value other than -1, number of
-          seconds between connection recycling, which means upon
-          checkout, if this timeout is surpassed the connection will be
-          closed and replaced with a newly opened connection. Defaults to -1.
-
-        :param logging_name:  String identifier which will be used within
-          the "name" field of logging records generated within the
-          "sqlalchemy.pool" logger. Defaults to a hexstring of the object's
-          id.
-
-        :param echo: if True, the connection pool will log
-         informational output such as when connections are invalidated
-         as well as when connections are recycled to the default log handler,
-         which defaults to ``sys.stdout`` for output..   If set to the string
-         ``"debug"``, the logging will include pool checkouts and checkins.
-
-         The :paramref:`_pool.Pool.echo` parameter can also be set from the
-         :func:`_sa.create_engine` call by using the
-         :paramref:`_sa.create_engine.echo_pool` parameter.
-
-         .. seealso::
-
-             :ref:`dbengine_logging` - further detail on how to configure
-             logging.
-
-        :param reset_on_return: Determine steps to take on
-         connections as they are returned to the pool, which were
-         not otherwise handled by a :class:`_engine.Connection`.
-         Available from :func:`_sa.create_engine` via the
-         :paramref:`_sa.create_engine.pool_reset_on_return` parameter.
-
-         :paramref:`_pool.Pool.reset_on_return` can have any of these values:
-
-         * ``"rollback"`` - call rollback() on the connection,
-           to release locks and transaction resources.
-           This is the default value.  The vast majority
-           of use cases should leave this value set.
-         * ``"commit"`` - call commit() on the connection,
-           to release locks and transaction resources.
-           A commit here may be desirable for databases that
-           cache query plans if a commit is emitted,
-           such as Microsoft SQL Server.  However, this
-           value is more dangerous than 'rollback' because
-           any data changes present on the transaction
-           are committed unconditionally.
-         * ``None`` - don't do anything on the connection.
-           This setting may be appropriate if the database / DBAPI
-           works in pure "autocommit" mode at all times, or if
-           a custom reset handler is established using the
-           :meth:`.PoolEvents.reset` event handler.
-
-         * ``True`` - same as 'rollback', this is here for
-           backwards compatibility.
-         * ``False`` - same as None, this is here for
-           backwards compatibility.
-
-         For further customization of reset on return, the
-         :meth:`.PoolEvents.reset` event hook may be used which can perform
-         any connection activity desired on reset.
-
-         .. seealso::
-
-            :ref:`pool_reset_on_return`
-
-            :meth:`.PoolEvents.reset`
-
-        :param events: a list of 2-tuples, each of the form
-         ``(callable, target)`` which will be passed to :func:`.event.listen`
-         upon construction.   Provided here so that event listeners
-         can be assigned via :func:`_sa.create_engine` before dialect-level
-         listeners are applied.
-
-        :param dialect: a :class:`.Dialect` that will handle the job
-         of calling rollback(), close(), or commit() on DBAPI connections.
-         If omitted, a built-in "stub" dialect is used.   Applications that
-         make use of :func:`_sa.create_engine` should not use this parameter
-         as it is handled by the engine creation strategy.
-
-        :param pre_ping: if True, the pool will emit a "ping" (typically
-         "SELECT 1", but is dialect-specific) on the connection
-         upon checkout, to test if the connection is alive or not.   If not,
-         the connection is transparently re-connected and upon success, all
-         other pooled connections established prior to that timestamp are
-         invalidated.     Requires that a dialect is passed as well to
-         interpret the disconnection error.
-
-         .. versionadded:: 1.2
-
-        """
-        if logging_name:
-            self.logging_name = self._orig_logging_name = logging_name
-        else:
-            self._orig_logging_name = None
-
-        log.instance_logger(self, echoflag=echo)
-        self._creator = creator
-        self._recycle = recycle
-        self._invalidate_time = 0
-        self._pre_ping = pre_ping
-        self._reset_on_return = util.parse_user_argument_for_enum(
-            reset_on_return,
-            {
-                ResetStyle.reset_rollback: ["rollback", True],
-                ResetStyle.reset_none: ["none", None, False],
-                ResetStyle.reset_commit: ["commit"],
-            },
-            "reset_on_return",
-        )
-
-        self.echo = echo
-
-        if _dispatch:
-            self.dispatch._update(_dispatch, only_propagate=False)
-        if dialect:
-            self._dialect = dialect
-        if events:
-            for fn, target in events:
-                event.listen(self, target, fn)
-
-    @util.hybridproperty
-    def _is_asyncio(self) -> bool:
-        return self._dialect.is_async
-
-    @property
-    def _creator(self) -> Union[_CreatorFnType, _CreatorWRecFnType]:
-        return self._creator_arg
-
-    @_creator.setter
-    def _creator(
-        self, creator: Union[_CreatorFnType, _CreatorWRecFnType]
-    ) -> None:
-        self._creator_arg = creator
-
-        # mypy seems to get super confused assigning functions to
-        # attributes
-        self._invoke_creator = self._should_wrap_creator(creator)
-
-    @_creator.deleter
-    def _creator(self) -> None:
-        # needed for mock testing
-        del self._creator_arg
-        del self._invoke_creator
-
-    def _should_wrap_creator(
-        self, creator: Union[_CreatorFnType, _CreatorWRecFnType]
-    ) -> _CreatorWRecFnType:
-        """Detect if creator accepts a single argument, or is sent
-        as a legacy style no-arg function.
-
-        """
-
-        try:
-            argspec = util.get_callable_argspec(self._creator, no_self=True)
-        except TypeError:
-            creator_fn = cast(_CreatorFnType, creator)
-            return lambda rec: creator_fn()
-
-        if argspec.defaults is not None:
-            defaulted = len(argspec.defaults)
-        else:
-            defaulted = 0
-        positionals = len(argspec[0]) - defaulted
-
-        # look for the exact arg signature that DefaultStrategy
-        # sends us
-        if (argspec[0], argspec[3]) == (["connection_record"], (None,)):
-            return cast(_CreatorWRecFnType, creator)
-        # or just a single positional
-        elif positionals == 1:
-            return cast(_CreatorWRecFnType, creator)
-        # all other cases, just wrap and assume legacy "creator" callable
-        # thing
-        else:
-            creator_fn = cast(_CreatorFnType, creator)
-            return lambda rec: creator_fn()
-
-    def _close_connection(
-        self, connection: DBAPIConnection, *, terminate: bool = False
-    ) -> None:
-        self.logger.debug(
-            "%s connection %r",
-            "Hard-closing" if terminate else "Closing",
-            connection,
-        )
-        try:
-            if terminate:
-                self._dialect.do_terminate(connection)
-            else:
-                self._dialect.do_close(connection)
-        except BaseException as e:
-            self.logger.error(
-                f"Exception {'terminating' if terminate else 'closing'} "
-                f"connection %r",
-                connection,
-                exc_info=True,
-            )
-            if not isinstance(e, Exception):
-                raise
-
-    def _create_connection(self) -> ConnectionPoolEntry:
-        """Called by subclasses to create a new ConnectionRecord."""
-
-        return _ConnectionRecord(self)
-
-    def _invalidate(
-        self,
-        connection: PoolProxiedConnection,
-        exception: Optional[BaseException] = None,
-        _checkin: bool = True,
-    ) -> None:
-        """Mark all connections established within the generation
-        of the given connection as invalidated.
-
-        If this pool's last invalidate time is before when the given
-        connection was created, update the timestamp til now.  Otherwise,
-        no action is performed.
-
-        Connections with a start time prior to this pool's invalidation
-        time will be recycled upon next checkout.
-        """
-        rec = getattr(connection, "_connection_record", None)
-        if not rec or self._invalidate_time < rec.starttime:
-            self._invalidate_time = time.time()
-        if _checkin and getattr(connection, "is_valid", False):
-            connection.invalidate(exception)
-
-    def recreate(self) -> Pool:
-        """Return a new :class:`_pool.Pool`, of the same class as this one
-        and configured with identical creation arguments.
-
-        This method is used in conjunction with :meth:`dispose`
-        to close out an entire :class:`_pool.Pool` and create a new one in
-        its place.
-
-        """
-
-        raise NotImplementedError()
-
-    def dispose(self) -> None:
-        """Dispose of this pool.
-
-        This method leaves the possibility of checked-out connections
-        remaining open, as it only affects connections that are
-        idle in the pool.
-
-        .. seealso::
-
-            :meth:`Pool.recreate`
-
-        """
-
-        raise NotImplementedError()
-
-    def connect(self) -> PoolProxiedConnection:
-        """Return a DBAPI connection from the pool.
-
-        The connection is instrumented such that when its
-        ``close()`` method is called, the connection will be returned to
-        the pool.
-
-        """
-        return _ConnectionFairy._checkout(self)
-
-    def _return_conn(self, record: ConnectionPoolEntry) -> None:
-        """Given a _ConnectionRecord, return it to the :class:`_pool.Pool`.
-
-        This method is called when an instrumented DBAPI connection
-        has its ``close()`` method called.
-
-        """
-        self._do_return_conn(record)
-
-    def _do_get(self) -> ConnectionPoolEntry:
-        """Implementation for :meth:`get`, supplied by subclasses."""
-
-        raise NotImplementedError()
-
-    def _do_return_conn(self, record: ConnectionPoolEntry) -> None:
-        """Implementation for :meth:`return_conn`, supplied by subclasses."""
-
-        raise NotImplementedError()
-
-    def status(self) -> str:
-        """Returns a brief description of the state of this pool."""
-        raise NotImplementedError()
-
-
-class ManagesConnection:
-    """Common base for the two connection-management interfaces
-    :class:`.PoolProxiedConnection` and :class:`.ConnectionPoolEntry`.
-
-    These two objects are typically exposed in the public facing API
-    via the connection pool event hooks, documented at :class:`.PoolEvents`.
-
-    .. versionadded:: 2.0
-
-    """
-
-    __slots__ = ()
-
-    dbapi_connection: Optional[DBAPIConnection]
-    """A reference to the actual DBAPI connection being tracked.
-
-    This is a :pep:`249`-compliant object that for traditional sync-style
-    dialects is provided by the third-party
-    DBAPI implementation in use.  For asyncio dialects, the implementation
-    is typically an adapter object provided by the SQLAlchemy dialect
-    itself; the underlying asyncio object is available via the
-    :attr:`.ManagesConnection.driver_connection` attribute.
-
-    SQLAlchemy's interface for the DBAPI connection is based on the
-    :class:`.DBAPIConnection` protocol object
-
-    .. seealso::
-
-        :attr:`.ManagesConnection.driver_connection`
-
-        :ref:`faq_dbapi_connection`
-
-    """
-
-    driver_connection: Optional[Any]
-    """The "driver level" connection object as used by the Python
-    DBAPI or database driver.
-
-    For traditional :pep:`249` DBAPI implementations, this object will
-    be the same object as that of
-    :attr:`.ManagesConnection.dbapi_connection`.   For an asyncio database
-    driver, this will be the ultimate "connection" object used by that
-    driver, such as the ``asyncpg.Connection`` object which will not have
-    standard pep-249 methods.
-
-    .. versionadded:: 1.4.24
-
-    .. seealso::
-
-        :attr:`.ManagesConnection.dbapi_connection`
-
-        :ref:`faq_dbapi_connection`
-
-    """
-
-    @util.ro_memoized_property
-    def info(self) -> _InfoType:
-        """Info dictionary associated with the underlying DBAPI connection
-        referred to by this :class:`.ManagesConnection` instance, allowing
-        user-defined data to be associated with the connection.
-
-        The data in this dictionary is persistent for the lifespan
-        of the DBAPI connection itself, including across pool checkins
-        and checkouts.  When the connection is invalidated
-        and replaced with a new one, this dictionary is cleared.
-
-        For a :class:`.PoolProxiedConnection` instance that's not associated
-        with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
-        attribute returns a dictionary that is local to that
-        :class:`.ConnectionPoolEntry`. Therefore the
-        :attr:`.ManagesConnection.info` attribute will always provide a Python
-        dictionary.
-
-        .. seealso::
-
-            :attr:`.ManagesConnection.record_info`
-
-
-        """
-        raise NotImplementedError()
-
-    @util.ro_memoized_property
-    def record_info(self) -> Optional[_InfoType]:
-        """Persistent info dictionary associated with this
-        :class:`.ManagesConnection`.
-
-        Unlike the :attr:`.ManagesConnection.info` dictionary, the lifespan
-        of this dictionary is that of the :class:`.ConnectionPoolEntry`
-        which owns it; therefore this dictionary will persist across
-        reconnects and connection invalidation for a particular entry
-        in the connection pool.
-
-        For a :class:`.PoolProxiedConnection` instance that's not associated
-        with a :class:`.ConnectionPoolEntry`, such as if it were detached, the
-        attribute returns None. Contrast to the :attr:`.ManagesConnection.info`
-        dictionary which is never None.
-
-
-        .. seealso::
-
-            :attr:`.ManagesConnection.info`
-
-        """
-        raise NotImplementedError()
-
-    def invalidate(
-        self, e: Optional[BaseException] = None, soft: bool = False
-    ) -> None:
-        """Mark the managed connection as invalidated.
-
-        :param e: an exception object indicating a reason for the invalidation.
-
-        :param soft: if True, the connection isn't closed; instead, this
-         connection will be recycled on next checkout.
-
-        .. seealso::
-
-            :ref:`pool_connection_invalidation`
-
-
-        """
-        raise NotImplementedError()
-
-
-class ConnectionPoolEntry(ManagesConnection):
-    """Interface for the object that maintains an individual database
-    connection on behalf of a :class:`_pool.Pool` instance.
-
-    The :class:`.ConnectionPoolEntry` object represents the long term
-    maintenance of a particular connection for a pool, including expiring or
-    invalidating that connection to have it replaced with a new one, which will
-    continue to be maintained by that same :class:`.ConnectionPoolEntry`
-    instance. Compared to :class:`.PoolProxiedConnection`, which is the
-    short-term, per-checkout connection manager, this object lasts for the
-    lifespan of a particular "slot" within a connection pool.
-
-    The :class:`.ConnectionPoolEntry` object is mostly visible to public-facing
-    API code when it is delivered to connection pool event hooks, such as
-    :meth:`_events.PoolEvents.connect` and :meth:`_events.PoolEvents.checkout`.
-
-    .. versionadded:: 2.0  :class:`.ConnectionPoolEntry` provides the public
-       facing interface for the :class:`._ConnectionRecord` internal class.
-
-    """
-
-    __slots__ = ()
-
-    @property
-    def in_use(self) -> bool:
-        """Return True the connection is currently checked out"""
-
-        raise NotImplementedError()
-
-    def close(self) -> None:
-        """Close the DBAPI connection managed by this connection pool entry."""
-        raise NotImplementedError()
-
-
-class _ConnectionRecord(ConnectionPoolEntry):
-    """Maintains a position in a connection pool which references a pooled
-    connection.
-
-    This is an internal object used by the :class:`_pool.Pool` implementation
-    to provide context management to a DBAPI connection maintained by
-    that :class:`_pool.Pool`.   The public facing interface for this class
-    is described by the :class:`.ConnectionPoolEntry` class.  See that
-    class for public API details.
-
-    .. seealso::
-
-        :class:`.ConnectionPoolEntry`
-
-        :class:`.PoolProxiedConnection`
-
-    """
-
-    __slots__ = (
-        "__pool",
-        "fairy_ref",
-        "finalize_callback",
-        "fresh",
-        "starttime",
-        "dbapi_connection",
-        "__weakref__",
-        "__dict__",
-    )
-
-    finalize_callback: Deque[Callable[[DBAPIConnection], None]]
-    fresh: bool
-    fairy_ref: Optional[weakref.ref[_ConnectionFairy]]
-    starttime: float
-
-    def __init__(self, pool: Pool, connect: bool = True):
-        self.fresh = False
-        self.fairy_ref = None
-        self.starttime = 0
-        self.dbapi_connection = None
-
-        self.__pool = pool
-        if connect:
-            self.__connect()
-        self.finalize_callback = deque()
-
-    dbapi_connection: Optional[DBAPIConnection]
-
-    @property
-    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa: E501
-        if self.dbapi_connection is None:
-            return None
-        else:
-            return self.__pool._dialect.get_driver_connection(
-                self.dbapi_connection
-            )
-
-    @property
-    @util.deprecated(
-        "2.0",
-        "The _ConnectionRecord.connection attribute is deprecated; "
-        "please use 'driver_connection'",
-    )
-    def connection(self) -> Optional[DBAPIConnection]:
-        return self.dbapi_connection
-
-    _soft_invalidate_time: float = 0
-
-    @util.ro_memoized_property
-    def info(self) -> _InfoType:
-        return {}
-
-    @util.ro_memoized_property
-    def record_info(self) -> Optional[_InfoType]:
-        return {}
-
-    @classmethod
-    def checkout(cls, pool: Pool) -> _ConnectionFairy:
-        if TYPE_CHECKING:
-            rec = cast(_ConnectionRecord, pool._do_get())
-        else:
-            rec = pool._do_get()
-
-        try:
-            dbapi_connection = rec.get_connection()
-        except BaseException as err:
-            with util.safe_reraise():
-                rec._checkin_failed(err, _fairy_was_created=False)
-
-            # not reached, for code linters only
-            raise
-
-        echo = pool._should_log_debug()
-        fairy = _ConnectionFairy(pool, dbapi_connection, rec, echo)
-
-        rec.fairy_ref = ref = weakref.ref(
-            fairy,
-            lambda ref: (
-                _finalize_fairy(
-                    None, rec, pool, ref, echo, transaction_was_reset=False
-                )
-                if _finalize_fairy is not None
-                else None
-            ),
-        )
-        _strong_ref_connection_records[ref] = rec
-        if echo:
-            pool.logger.debug(
-                "Connection %r checked out from pool", dbapi_connection
-            )
-        return fairy
-
-    def _checkin_failed(
-        self, err: BaseException, _fairy_was_created: bool = True
-    ) -> None:
-        self.invalidate(e=err)
-        self.checkin(
-            _fairy_was_created=_fairy_was_created,
-        )
-
-    def checkin(self, _fairy_was_created: bool = True) -> None:
-        if self.fairy_ref is None and _fairy_was_created:
-            # _fairy_was_created is False for the initial get connection phase;
-            # meaning there was no _ConnectionFairy and we must unconditionally
-            # do a checkin.
-            #
-            # otherwise, if fairy_was_created==True, if fairy_ref is None here
-            # that means we were checked in already, so this looks like
-            # a double checkin.
-            util.warn("Double checkin attempted on %s" % self)
-            return
-        self.fairy_ref = None
-        connection = self.dbapi_connection
-        pool = self.__pool
-        while self.finalize_callback:
-            finalizer = self.finalize_callback.pop()
-            if connection is not None:
-                finalizer(connection)
-        if pool.dispatch.checkin:
-            pool.dispatch.checkin(connection, self)
-
-        pool._return_conn(self)
-
-    @property
-    def in_use(self) -> bool:
-        return self.fairy_ref is not None
-
-    @property
-    def last_connect_time(self) -> float:
-        return self.starttime
-
-    def close(self) -> None:
-        if self.dbapi_connection is not None:
-            self.__close()
-
-    def invalidate(
-        self, e: Optional[BaseException] = None, soft: bool = False
-    ) -> None:
-        # already invalidated
-        if self.dbapi_connection is None:
-            return
-        if soft:
-            self.__pool.dispatch.soft_invalidate(
-                self.dbapi_connection, self, e
-            )
-        else:
-            self.__pool.dispatch.invalidate(self.dbapi_connection, self, e)
-        if e is not None:
-            self.__pool.logger.info(
-                "%sInvalidate connection %r (reason: %s:%s)",
-                "Soft " if soft else "",
-                self.dbapi_connection,
-                e.__class__.__name__,
-                e,
-            )
-        else:
-            self.__pool.logger.info(
-                "%sInvalidate connection %r",
-                "Soft " if soft else "",
-                self.dbapi_connection,
-            )
-
-        if soft:
-            self._soft_invalidate_time = time.time()
-        else:
-            self.__close(terminate=True)
-            self.dbapi_connection = None
-
-    def get_connection(self) -> DBAPIConnection:
-        recycle = False
-
-        # NOTE: the various comparisons here are assuming that measurable time
-        # passes between these state changes.  however, time.time() is not
-        # guaranteed to have sub-second precision.  comparisons of
-        # "invalidation time" to "starttime" should perhaps use >= so that the
-        # state change can take place assuming no measurable  time has passed,
-        # however this does not guarantee correct behavior here as if time
-        # continues to not pass, it will try to reconnect repeatedly until
-        # these timestamps diverge, so in that sense using > is safer.  Per
-        # https://stackoverflow.com/a/1938096/34549, Windows time.time() may be
-        # within 16 milliseconds accuracy, so unit tests for connection
-        # invalidation need a sleep of at least this long between initial start
-        # time and invalidation for the logic below to work reliably.
-
-        if self.dbapi_connection is None:
-            self.info.clear()
-            self.__connect()
-        elif (
-            self.__pool._recycle > -1
-            and time.time() - self.starttime > self.__pool._recycle
-        ):
-            self.__pool.logger.info(
-                "Connection %r exceeded timeout; recycling",
-                self.dbapi_connection,
-            )
-            recycle = True
-        elif self.__pool._invalidate_time > self.starttime:
-            self.__pool.logger.info(
-                "Connection %r invalidated due to pool invalidation; "
-                + "recycling",
-                self.dbapi_connection,
-            )
-            recycle = True
-        elif self._soft_invalidate_time > self.starttime:
-            self.__pool.logger.info(
-                "Connection %r invalidated due to local soft invalidation; "
-                + "recycling",
-                self.dbapi_connection,
-            )
-            recycle = True
-
-        if recycle:
-            self.__close(terminate=True)
-            self.info.clear()
-
-            self.__connect()
-
-        assert self.dbapi_connection is not None
-        return self.dbapi_connection
-
-    def _is_hard_or_soft_invalidated(self) -> bool:
-        return (
-            self.dbapi_connection is None
-            or self.__pool._invalidate_time > self.starttime
-            or (self._soft_invalidate_time > self.starttime)
-        )
-
-    def __close(self, *, terminate: bool = False) -> None:
-        self.finalize_callback.clear()
-        if self.__pool.dispatch.close:
-            self.__pool.dispatch.close(self.dbapi_connection, self)
-        assert self.dbapi_connection is not None
-        self.__pool._close_connection(
-            self.dbapi_connection, terminate=terminate
-        )
-        self.dbapi_connection = None
-
-    def __connect(self) -> None:
-        pool = self.__pool
-
-        # ensure any existing connection is removed, so that if
-        # creator fails, this attribute stays None
-        self.dbapi_connection = None
-        try:
-            self.starttime = time.time()
-            self.dbapi_connection = connection = pool._invoke_creator(self)
-            pool.logger.debug("Created new connection %r", connection)
-            self.fresh = True
-        except BaseException as e:
-            with util.safe_reraise():
-                pool.logger.debug("Error on connect(): %s", e)
-        else:
-            # in SQLAlchemy 1.4 the first_connect event is not used by
-            # the engine, so this will usually not be set
-            if pool.dispatch.first_connect:
-                pool.dispatch.first_connect.for_modify(
-                    pool.dispatch
-                ).exec_once_unless_exception(self.dbapi_connection, self)
-
-            # init of the dialect now takes place within the connect
-            # event, so ensure a mutex is used on the first run
-            pool.dispatch.connect.for_modify(
-                pool.dispatch
-            )._exec_w_sync_on_first_run(self.dbapi_connection, self)
-
-
-def _finalize_fairy(
-    dbapi_connection: Optional[DBAPIConnection],
-    connection_record: Optional[_ConnectionRecord],
-    pool: Pool,
-    ref: Optional[
-        weakref.ref[_ConnectionFairy]
-    ],  # this is None when called directly, not by the gc
-    echo: Optional[log._EchoFlagType],
-    transaction_was_reset: bool = False,
-    fairy: Optional[_ConnectionFairy] = None,
-) -> None:
-    """Cleanup for a :class:`._ConnectionFairy` whether or not it's already
-    been garbage collected.
-
-    When using an async dialect no IO can happen here (without using
-    a dedicated thread), since this is called outside the greenlet
-    context and with an already running loop. In this case function
-    will only log a message and raise a warning.
-    """
-
-    is_gc_cleanup = ref is not None
-
-    if is_gc_cleanup:
-        assert ref is not None
-        _strong_ref_connection_records.pop(ref, None)
-        assert connection_record is not None
-        if connection_record.fairy_ref is not ref:
-            return
-        assert dbapi_connection is None
-        dbapi_connection = connection_record.dbapi_connection
-
-    elif fairy:
-        _strong_ref_connection_records.pop(weakref.ref(fairy), None)
-
-    # null pool is not _is_asyncio but can be used also with async dialects
-    dont_restore_gced = pool._dialect.is_async
-
-    if dont_restore_gced:
-        detach = connection_record is None or is_gc_cleanup
-        can_manipulate_connection = not is_gc_cleanup
-        can_close_or_terminate_connection = (
-            not pool._dialect.is_async or pool._dialect.has_terminate
-        )
-        requires_terminate_for_close = (
-            pool._dialect.is_async and pool._dialect.has_terminate
-        )
-
-    else:
-        detach = connection_record is None
-        can_manipulate_connection = can_close_or_terminate_connection = True
-        requires_terminate_for_close = False
-
-    if dbapi_connection is not None:
-        if connection_record and echo:
-            pool.logger.debug(
-                "Connection %r being returned to pool", dbapi_connection
-            )
-
-        try:
-            if not fairy:
-                assert connection_record is not None
-                fairy = _ConnectionFairy(
-                    pool,
-                    dbapi_connection,
-                    connection_record,
-                    echo,
-                )
-            assert fairy.dbapi_connection is dbapi_connection
-
-            fairy._reset(
-                pool,
-                transaction_was_reset=transaction_was_reset,
-                terminate_only=detach,
-                asyncio_safe=can_manipulate_connection,
-            )
-
-            if detach:
-                if connection_record:
-                    fairy._pool = pool
-                    fairy.detach()
-
-                if can_close_or_terminate_connection:
-                    if pool.dispatch.close_detached:
-                        pool.dispatch.close_detached(dbapi_connection)
-
-                    pool._close_connection(
-                        dbapi_connection,
-                        terminate=requires_terminate_for_close,
-                    )
-
-        except BaseException as e:
-            pool.logger.error(
-                "Exception during reset or similar", exc_info=True
-            )
-            if connection_record:
-                connection_record.invalidate(e=e)
-            if not isinstance(e, Exception):
-                raise
-        finally:
-            if detach and is_gc_cleanup and dont_restore_gced:
-                message = (
-                    "The garbage collector is trying to clean up "
-                    f"non-checked-in connection {dbapi_connection!r}, "
-                    f"""which will be {
-                        'dropped, as it cannot be safely terminated'
-                        if not can_close_or_terminate_connection
-                        else 'terminated'
-                    }.  """
-                    "Please ensure that SQLAlchemy pooled connections are "
-                    "returned to "
-                    "the pool explicitly, either by calling ``close()`` "
-                    "or by using appropriate context managers to manage "
-                    "their lifecycle."
-                )
-                pool.logger.error(message)
-                util.warn(message)
-
-    if connection_record and connection_record.fairy_ref is not None:
-        connection_record.checkin()
-
-    # give gc some help.  See
-    # test/engine/test_pool.py::PoolEventsTest::test_checkin_event_gc[True]
-    # which actually started failing when pytest warnings plugin was
-    # turned on, due to util.warn() above
-    if fairy is not None:
-        fairy.dbapi_connection = None  # type: ignore
-        fairy._connection_record = None
-    del dbapi_connection
-    del connection_record
-    del fairy
-
-
-# a dictionary of the _ConnectionFairy weakrefs to _ConnectionRecord, so that
-# GC under pypy will call ConnectionFairy finalizers.  linked directly to the
-# weakref that will empty itself when collected so that it should not create
-# any unmanaged memory references.
-_strong_ref_connection_records: Dict[
-    weakref.ref[_ConnectionFairy], _ConnectionRecord
-] = {}
-
-
-class PoolProxiedConnection(ManagesConnection):
-    """A connection-like adapter for a :pep:`249` DBAPI connection, which
-    includes additional methods specific to the :class:`.Pool` implementation.
-
-    :class:`.PoolProxiedConnection` is the public-facing interface for the
-    internal :class:`._ConnectionFairy` implementation object; users familiar
-    with :class:`._ConnectionFairy` can consider this object to be equivalent.
-
-    .. versionadded:: 2.0  :class:`.PoolProxiedConnection` provides the public-
-       facing interface for the :class:`._ConnectionFairy` internal class.
-
-    """
-
-    __slots__ = ()
-
-    if typing.TYPE_CHECKING:
-
-        def commit(self) -> None: ...
-
-        def cursor(self, *args: Any, **kwargs: Any) -> DBAPICursor: ...
-
-        def rollback(self) -> None: ...
-
-        def __getattr__(self, key: str) -> Any: ...
-
-    @property
-    def is_valid(self) -> bool:
-        """Return True if this :class:`.PoolProxiedConnection` still refers
-        to an active DBAPI connection."""
-
-        raise NotImplementedError()
-
-    @property
-    def is_detached(self) -> bool:
-        """Return True if this :class:`.PoolProxiedConnection` is detached
-        from its pool."""
-
-        raise NotImplementedError()
-
-    def detach(self) -> None:
-        """Separate this connection from its Pool.
-
-        This means that the connection will no longer be returned to the
-        pool when closed, and will instead be literally closed.  The
-        associated :class:`.ConnectionPoolEntry` is de-associated from this
-        DBAPI connection.
-
-        Note that any overall connection limiting constraints imposed by a
-        Pool implementation may be violated after a detach, as the detached
-        connection is removed from the pool's knowledge and control.
-
-        """
-
-        raise NotImplementedError()
-
-    def close(self) -> None:
-        """Release this connection back to the pool.
-
-        The :meth:`.PoolProxiedConnection.close` method shadows the
-        :pep:`249` ``.close()`` method, altering its behavior to instead
-        :term:`release` the proxied connection back to the connection pool.
-
-        Upon release to the pool, whether the connection stays "opened" and
-        pooled in the Python process, versus actually closed out and removed
-        from the Python process, is based on the pool implementation in use and
-        its configuration and current state.
-
-        """
-        raise NotImplementedError()
-
-    def __enter__(self) -> Self:
-        return self
-
-    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> None:
-        self.close()
-        return None
-
-
-class _AdhocProxiedConnection(PoolProxiedConnection):
-    """provides the :class:`.PoolProxiedConnection` interface for cases where
-    the DBAPI connection is not actually proxied.
-
-    This is used by the engine internals to pass a consistent
-    :class:`.PoolProxiedConnection` object to consuming dialects in response to
-    pool events that may not always have the :class:`._ConnectionFairy`
-    available.
-
-    """
-
-    __slots__ = ("dbapi_connection", "_connection_record", "_is_valid")
-
-    dbapi_connection: DBAPIConnection
-    _connection_record: ConnectionPoolEntry
-
-    def __init__(
-        self,
-        dbapi_connection: DBAPIConnection,
-        connection_record: ConnectionPoolEntry,
-    ):
-        self.dbapi_connection = dbapi_connection
-        self._connection_record = connection_record
-        self._is_valid = True
-
-    @property
-    def driver_connection(self) -> Any:  # type: ignore[override]  # mypy#4125
-        return self._connection_record.driver_connection
-
-    @property
-    def connection(self) -> DBAPIConnection:
-        return self.dbapi_connection
-
-    @property
-    def is_valid(self) -> bool:
-        """Implement is_valid state attribute.
-
-        for the adhoc proxied connection it's assumed the connection is valid
-        as there is no "invalidate" routine.
-
-        """
-        return self._is_valid
-
-    def invalidate(
-        self, e: Optional[BaseException] = None, soft: bool = False
-    ) -> None:
-        self._is_valid = False
-
-    @util.ro_non_memoized_property
-    def record_info(self) -> Optional[_InfoType]:
-        return self._connection_record.record_info
-
-    def cursor(self, *args: Any, **kwargs: Any) -> DBAPICursor:
-        return self.dbapi_connection.cursor(*args, **kwargs)
-
-    def __getattr__(self, key: Any) -> Any:
-        return getattr(self.dbapi_connection, key)
-
-
-class _ConnectionFairy(PoolProxiedConnection):
-    """Proxies a DBAPI connection and provides return-on-dereference
-    support.
-
-    This is an internal object used by the :class:`_pool.Pool` implementation
-    to provide context management to a DBAPI connection delivered by
-    that :class:`_pool.Pool`.   The public facing interface for this class
-    is described by the :class:`.PoolProxiedConnection` class.  See that
-    class for public API details.
-
-    The name "fairy" is inspired by the fact that the
-    :class:`._ConnectionFairy` object's lifespan is transitory, as it lasts
-    only for the length of a specific DBAPI connection being checked out from
-    the pool, and additionally that as a transparent proxy, it is mostly
-    invisible.
-
-    .. seealso::
-
-        :class:`.PoolProxiedConnection`
-
-        :class:`.ConnectionPoolEntry`
-
-
-    """
-
-    __slots__ = (
-        "dbapi_connection",
-        "_connection_record",
-        "_echo",
-        "_pool",
-        "_counter",
-        "__weakref__",
-        "__dict__",
-    )
-
-    pool: Pool
-    dbapi_connection: DBAPIConnection
-    _echo: log._EchoFlagType
-
-    def __init__(
-        self,
-        pool: Pool,
-        dbapi_connection: DBAPIConnection,
-        connection_record: _ConnectionRecord,
-        echo: log._EchoFlagType,
-    ):
-        self._pool = pool
-        self._counter = 0
-        self.dbapi_connection = dbapi_connection
-        self._connection_record = connection_record
-        self._echo = echo
-
-    _connection_record: Optional[_ConnectionRecord]
-
-    @property
-    def driver_connection(self) -> Optional[Any]:  # type: ignore[override]  # mypy#4125  # noqa: E501
-        if self._connection_record is None:
-            return None
-        return self._connection_record.driver_connection
-
-    @property
-    @util.deprecated(
-        "2.0",
-        "The _ConnectionFairy.connection attribute is deprecated; "
-        "please use 'driver_connection'",
-    )
-    def connection(self) -> DBAPIConnection:
-        return self.dbapi_connection
-
-    @classmethod
-    def _checkout(
-        cls,
-        pool: Pool,
-        threadconns: Optional[threading.local] = None,
-        fairy: Optional[_ConnectionFairy] = None,
-    ) -> _ConnectionFairy:
-        if not fairy:
-            fairy = _ConnectionRecord.checkout(pool)
-
-            if threadconns is not None:
-                threadconns.current = weakref.ref(fairy)
-
-        assert (
-            fairy._connection_record is not None
-        ), "can't 'checkout' a detached connection fairy"
-        assert (
-            fairy.dbapi_connection is not None
-        ), "can't 'checkout' an invalidated connection fairy"
-
-        fairy._counter += 1
-        if (
-            not pool.dispatch.checkout and not pool._pre_ping
-        ) or fairy._counter != 1:
-            return fairy
-
-        # Pool listeners can trigger a reconnection on checkout, as well
-        # as the pre-pinger.
-        # there are three attempts made here, but note that if the database
-        # is not accessible from a connection standpoint, those won't proceed
-        # here.
-
-        attempts = 2
-
-        while attempts > 0:
-            connection_is_fresh = fairy._connection_record.fresh
-            fairy._connection_record.fresh = False
+        def process(value):
             try:
-                if pool._pre_ping:
-                    if not connection_is_fresh:
-                        if fairy._echo:
-                            pool.logger.debug(
-                                "Pool pre-ping on connection %s",
-                                fairy.dbapi_connection,
-                            )
-                        result = pool._dialect._do_ping_w_event(
-                            fairy.dbapi_connection
-                        )
-                        if not result:
-                            if fairy._echo:
-                                pool.logger.debug(
-                                    "Pool pre-ping on connection %s failed, "
-                                    "will invalidate pool",
-                                    fairy.dbapi_connection,
-                                )
-                            raise exc.InvalidatePoolError()
-                    elif fairy._echo:
-                        pool.logger.debug(
-                            "Connection %s is fresh, skipping pre-ping",
-                            fairy.dbapi_connection,
-                        )
-
-                pool.dispatch.checkout(
-                    fairy.dbapi_connection, fairy._connection_record, fairy
-                )
-                return fairy
-            except exc.DisconnectionError as e:
-                if e.invalidate_pool:
-                    pool.logger.info(
-                        "Disconnection detected on checkout, "
-                        "invalidating all pooled connections prior to "
-                        "current timestamp (reason: %r)",
-                        e,
-                    )
-                    fairy._connection_record.invalidate(e)
-                    pool._invalidate(fairy, e, _checkin=False)
+                return default_processor(value)
+            except TypeError:
+                if isinstance(value, numbers.Number):
+                    return value
                 else:
-                    pool.logger.info(
-                        "Disconnection detected on checkout, "
-                        "invalidating individual connection %s (reason: %r)",
-                        fairy.dbapi_connection,
-                        e,
-                    )
-                    fairy._connection_record.invalidate(e)
-                try:
-                    fairy.dbapi_connection = (
-                        fairy._connection_record.get_connection()
-                    )
-                except BaseException as err:
-                    with util.safe_reraise():
-                        fairy._connection_record._checkin_failed(
-                            err,
-                            _fairy_was_created=True,
-                        )
-
-                        # prevent _ConnectionFairy from being carried
-                        # in the stack trace.  Do this after the
-                        # connection record has been checked in, so that
-                        # if the del triggers a finalize fairy, it won't
-                        # try to checkin a second time.
-                        del fairy
-
-                    # never called, this is for code linters
                     raise
 
-                attempts -= 1
-            except BaseException as be_outer:
-                with util.safe_reraise():
-                    rec = fairy._connection_record
-                    if rec is not None:
-                        rec._checkin_failed(
-                            be_outer,
-                            _fairy_was_created=True,
-                        )
+        return process
 
-                    # prevent _ConnectionFairy from being carried
-                    # in the stack trace, see above
-                    del fairy
 
-                # never called, this is for code linters
-                raise
+class _DateTimeMixin:
+    _reg = None
+    _storage_format = None
 
-        pool.logger.info("Reconnection attempts exhausted on checkout")
-        fairy.invalidate()
-        raise exc.InvalidRequestError("This connection is closed")
+    def __init__(self, storage_format=None, regexp=None, **kw):
+        super().__init__(**kw)
+        if regexp is not None:
+            self._reg = re.compile(regexp)
+        if storage_format is not None:
+            self._storage_format = storage_format
 
-    def _checkout_existing(self) -> _ConnectionFairy:
-        return _ConnectionFairy._checkout(self._pool, fairy=self)
+    @property
+    def format_is_text_affinity(self):
+        """return True if the storage format will automatically imply
+        a TEXT affinity.
 
-    def _checkin(self, transaction_was_reset: bool = False) -> None:
-        _finalize_fairy(
-            self.dbapi_connection,
-            self._connection_record,
-            self._pool,
-            None,
-            self._echo,
-            transaction_was_reset=transaction_was_reset,
-            fairy=self,
+        If the storage format contains no non-numeric characters,
+        it will imply a NUMERIC storage format on SQLite; in this case,
+        the type will generate its DDL as DATE_CHAR, DATETIME_CHAR,
+        TIME_CHAR.
+
+        """
+        spec = self._storage_format % {
+            "year": 0,
+            "month": 0,
+            "day": 0,
+            "hour": 0,
+            "minute": 0,
+            "second": 0,
+            "microsecond": 0,
+        }
+        return bool(re.search(r"[^0-9]", spec))
+
+    def adapt(self, cls, **kw):
+        if issubclass(cls, _DateTimeMixin):
+            if self._storage_format:
+                kw["storage_format"] = self._storage_format
+            if self._reg:
+                kw["regexp"] = self._reg
+        return super().adapt(cls, **kw)
+
+    def literal_processor(self, dialect):
+        bp = self.bind_processor(dialect)
+
+        def process(value):
+            return "'%s'" % bp(value)
+
+        return process
+
+
+class DATETIME(_DateTimeMixin, sqltypes.DateTime):
+    r"""Represent a Python datetime object in SQLite using a string.
+
+    The default string storage format is::
+
+        "%(year)04d-%(month)02d-%(day)02d %(hour)02d:%(minute)02d:%(second)02d.%(microsecond)06d"
+
+    e.g.:
+
+    .. sourcecode:: text
+
+        2021-03-15 12:05:57.105542
+
+    The incoming storage format is by default parsed using the
+    Python ``datetime.fromisoformat()`` function.
+
+    .. versionchanged:: 2.0  ``datetime.fromisoformat()`` is used for default
+       datetime string parsing.
+
+    The storage format can be customized to some degree using the
+    ``storage_format`` and ``regexp`` parameters, such as::
+
+        import re
+        from sqlalchemy.dialects.sqlite import DATETIME
+
+        dt = DATETIME(
+            storage_format=(
+                "%(year)04d/%(month)02d/%(day)02d %(hour)02d:%(minute)02d:%(second)02d"
+            ),
+            regexp=r"(\d+)/(\d+)/(\d+) (\d+)-(\d+)-(\d+)",
         )
 
-    def _close(self) -> None:
-        self._checkin()
+    :param truncate_microseconds: when ``True`` microseconds will be truncated
+     from the datetime. Can't be specified together with ``storage_format``
+     or ``regexp``.
 
-    def _reset(
-        self,
-        pool: Pool,
-        transaction_was_reset: bool,
-        terminate_only: bool,
-        asyncio_safe: bool,
-    ) -> None:
-        if pool.dispatch.reset:
-            pool.dispatch.reset(
-                self.dbapi_connection,
-                self._connection_record,
-                PoolResetState(
-                    transaction_was_reset=transaction_was_reset,
-                    terminate_only=terminate_only,
-                    asyncio_safe=asyncio_safe,
-                ),
+    :param storage_format: format string which will be applied to the dict
+     with keys year, month, day, hour, minute, second, and microsecond.
+
+    :param regexp: regular expression which will be applied to incoming result
+     rows, replacing the use of ``datetime.fromisoformat()`` to parse incoming
+     strings. If the regexp contains named groups, the resulting match dict is
+     applied to the Python datetime() constructor as keyword arguments.
+     Otherwise, if positional groups are used, the datetime() constructor
+     is called with positional arguments via
+     ``*map(int, match_obj.groups(0))``.
+
+    """  # noqa
+
+    _storage_format = (
+        "%(year)04d-%(month)02d-%(day)02d "
+        "%(hour)02d:%(minute)02d:%(second)02d.%(microsecond)06d"
+    )
+
+    def __init__(self, *args, **kwargs):
+        truncate_microseconds = kwargs.pop("truncate_microseconds", False)
+        super().__init__(*args, **kwargs)
+        if truncate_microseconds:
+            assert "storage_format" not in kwargs, (
+                "You can specify only "
+                "one of truncate_microseconds or storage_format."
+            )
+            assert "regexp" not in kwargs, (
+                "You can specify only one of "
+                "truncate_microseconds or regexp."
+            )
+            self._storage_format = (
+                "%(year)04d-%(month)02d-%(day)02d "
+                "%(hour)02d:%(minute)02d:%(second)02d"
             )
 
-        if not asyncio_safe:
-            return
+    def bind_processor(
+        self, dialect: Dialect
+    ) -> Optional[_BindProcessorType[Any]]:
+        datetime_datetime = datetime.datetime
+        datetime_date = datetime.date
+        format_ = self._storage_format
 
-        if pool._reset_on_return is reset_rollback:
-            if transaction_was_reset:
-                if self._echo:
-                    pool.logger.debug(
-                        "Connection %s reset, transaction already reset",
-                        self.dbapi_connection,
-                    )
+        def process(value):
+            if value is None:
+                return None
+            elif isinstance(value, datetime_datetime):
+                return format_ % {
+                    "year": value.year,
+                    "month": value.month,
+                    "day": value.day,
+                    "hour": value.hour,
+                    "minute": value.minute,
+                    "second": value.second,
+                    "microsecond": value.microsecond,
+                }
+            elif isinstance(value, datetime_date):
+                return format_ % {
+                    "year": value.year,
+                    "month": value.month,
+                    "day": value.day,
+                    "hour": 0,
+                    "minute": 0,
+                    "second": 0,
+                    "microsecond": 0,
+                }
             else:
-                if self._echo:
-                    pool.logger.debug(
-                        "Connection %s rollback-on-return",
-                        self.dbapi_connection,
-                    )
-                pool._dialect.do_rollback(self)
-        elif pool._reset_on_return is reset_commit:
-            if self._echo:
-                pool.logger.debug(
-                    "Connection %s commit-on-return",
-                    self.dbapi_connection,
+                raise TypeError(
+                    "SQLite DateTime type only accepts Python "
+                    "datetime and date objects as input."
                 )
-            pool._dialect.do_commit(self)
 
-    @property
-    def _logger(self) -> log._IdentifiedLoggerType:
-        return self._pool.logger
+        return process
 
-    @property
-    def is_valid(self) -> bool:
-        return self.dbapi_connection is not None
-
-    @property
-    def is_detached(self) -> bool:
-        return self._connection_record is None
-
-    @util.ro_memoized_property
-    def info(self) -> _InfoType:
-        if self._connection_record is None:
-            return {}
+    def result_processor(
+        self, dialect: Dialect, coltype: object
+    ) -> Optional[_ResultProcessorType[Any]]:
+        if self._reg:
+            return processors.str_to_datetime_processor_factory(
+                self._reg, datetime.datetime
+            )
         else:
-            return self._connection_record.info
+            return processors.str_to_datetime
 
-    @util.ro_non_memoized_property
-    def record_info(self) -> Optional[_InfoType]:
-        if self._connection_record is None:
+
+class DATE(_DateTimeMixin, sqltypes.Date):
+    r"""Represent a Python date object in SQLite using a string.
+
+    The default string storage format is::
+
+        "%(year)04d-%(month)02d-%(day)02d"
+
+    e.g.:
+
+    .. sourcecode:: text
+
+        2011-03-15
+
+    The incoming storage format is by default parsed using the
+    Python ``date.fromisoformat()`` function.
+
+    .. versionchanged:: 2.0  ``date.fromisoformat()`` is used for default
+       date string parsing.
+
+
+    The storage format can be customized to some degree using the
+    ``storage_format`` and ``regexp`` parameters, such as::
+
+        import re
+        from sqlalchemy.dialects.sqlite import DATE
+
+        d = DATE(
+            storage_format="%(month)02d/%(day)02d/%(year)04d",
+            regexp=re.compile("(?P<month>\d+)/(?P<day>\d+)/(?P<year>\d+)"),
+        )
+
+    :param storage_format: format string which will be applied to the
+     dict with keys year, month, and day.
+
+    :param regexp: regular expression which will be applied to
+     incoming result rows, replacing the use of ``date.fromisoformat()`` to
+     parse incoming strings. If the regexp contains named groups, the resulting
+     match dict is applied to the Python date() constructor as keyword
+     arguments. Otherwise, if positional groups are used, the date()
+     constructor is called with positional arguments via
+     ``*map(int, match_obj.groups(0))``.
+
+    """
+
+    _storage_format = "%(year)04d-%(month)02d-%(day)02d"
+
+    def bind_processor(
+        self, dialect: Dialect
+    ) -> Optional[_BindProcessorType[Any]]:
+        datetime_date = datetime.date
+        format_ = self._storage_format
+
+        def process(value):
+            if value is None:
+                return None
+            elif isinstance(value, datetime_date):
+                return format_ % {
+                    "year": value.year,
+                    "month": value.month,
+                    "day": value.day,
+                }
+            else:
+                raise TypeError(
+                    "SQLite Date type only accepts Python "
+                    "date objects as input."
+                )
+
+        return process
+
+    def result_processor(
+        self, dialect: Dialect, coltype: object
+    ) -> Optional[_ResultProcessorType[Any]]:
+        if self._reg:
+            return processors.str_to_datetime_processor_factory(
+                self._reg, datetime.date
+            )
+        else:
+            return processors.str_to_date
+
+
+class TIME(_DateTimeMixin, sqltypes.Time):
+    r"""Represent a Python time object in SQLite using a string.
+
+    The default string storage format is::
+
+        "%(hour)02d:%(minute)02d:%(second)02d.%(microsecond)06d"
+
+    e.g.:
+
+    .. sourcecode:: text
+
+        12:05:57.10558
+
+    The incoming storage format is by default parsed using the
+    Python ``time.fromisoformat()`` function.
+
+    .. versionchanged:: 2.0  ``time.fromisoformat()`` is used for default
+       time string parsing.
+
+    The storage format can be customized to some degree using the
+    ``storage_format`` and ``regexp`` parameters, such as::
+
+        import re
+        from sqlalchemy.dialects.sqlite import TIME
+
+        t = TIME(
+            storage_format="%(hour)02d-%(minute)02d-%(second)02d-%(microsecond)06d",
+            regexp=re.compile("(\d+)-(\d+)-(\d+)-(?:-(\d+))?"),
+        )
+
+    :param truncate_microseconds: when ``True`` microseconds will be truncated
+     from the time. Can't be specified together with ``storage_format``
+     or ``regexp``.
+
+    :param storage_format: format string which will be applied to the dict
+     with keys hour, minute, second, and microsecond.
+
+    :param regexp: regular expression which will be applied to incoming result
+     rows, replacing the use of ``datetime.fromisoformat()`` to parse incoming
+     strings. If the regexp contains named groups, the resulting match dict is
+     applied to the Python time() constructor as keyword arguments. Otherwise,
+     if positional groups are used, the time() constructor is called with
+     positional arguments via ``*map(int, match_obj.groups(0))``.
+
+    """
+
+    _storage_format = "%(hour)02d:%(minute)02d:%(second)02d.%(microsecond)06d"
+
+    def __init__(self, *args, **kwargs):
+        truncate_microseconds = kwargs.pop("truncate_microseconds", False)
+        super().__init__(*args, **kwargs)
+        if truncate_microseconds:
+            assert "storage_format" not in kwargs, (
+                "You can specify only "
+                "one of truncate_microseconds or storage_format."
+            )
+            assert "regexp" not in kwargs, (
+                "You can specify only one of "
+                "truncate_microseconds or regexp."
+            )
+            self._storage_format = "%(hour)02d:%(minute)02d:%(second)02d"
+
+    def bind_processor(self, dialect):
+        datetime_time = datetime.time
+        format_ = self._storage_format
+
+        def process(value):
+            if value is None:
+                return None
+            elif isinstance(value, datetime_time):
+                return format_ % {
+                    "hour": value.hour,
+                    "minute": value.minute,
+                    "second": value.second,
+                    "microsecond": value.microsecond,
+                }
+            else:
+                raise TypeError(
+                    "SQLite Time type only accepts Python "
+                    "time objects as input."
+                )
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        if self._reg:
+            return processors.str_to_datetime_processor_factory(
+                self._reg, datetime.time
+            )
+        else:
+            return processors.str_to_time
+
+
+colspecs = {
+    sqltypes.Date: DATE,
+    sqltypes.DateTime: DATETIME,
+    sqltypes.JSON: _SQliteJson,
+    sqltypes.JSON.JSONIndexType: JSONIndexType,
+    sqltypes.JSON.JSONPathType: JSONPathType,
+    sqltypes.Time: TIME,
+}
+
+ischema_names = {
+    "BIGINT": sqltypes.BIGINT,
+    "BLOB": sqltypes.BLOB,
+    "BOOL": sqltypes.BOOLEAN,
+    "BOOLEAN": sqltypes.BOOLEAN,
+    "CHAR": sqltypes.CHAR,
+    "DATE": sqltypes.DATE,
+    "DATE_CHAR": sqltypes.DATE,
+    "DATETIME": sqltypes.DATETIME,
+    "DATETIME_CHAR": sqltypes.DATETIME,
+    "DOUBLE": sqltypes.DOUBLE,
+    "DECIMAL": sqltypes.DECIMAL,
+    "FLOAT": sqltypes.FLOAT,
+    "INT": sqltypes.INTEGER,
+    "INTEGER": sqltypes.INTEGER,
+    "JSON": JSON,
+    "NUMERIC": sqltypes.NUMERIC,
+    "REAL": sqltypes.REAL,
+    "SMALLINT": sqltypes.SMALLINT,
+    "TEXT": sqltypes.TEXT,
+    "TIME": sqltypes.TIME,
+    "TIME_CHAR": sqltypes.TIME,
+    "TIMESTAMP": sqltypes.TIMESTAMP,
+    "VARCHAR": sqltypes.VARCHAR,
+    "NVARCHAR": sqltypes.NVARCHAR,
+    "NCHAR": sqltypes.NCHAR,
+}
+
+
+class SQLiteCompiler(compiler.SQLCompiler):
+    extract_map = util.update_copy(
+        compiler.SQLCompiler.extract_map,
+        {
+            "month": "%m",
+            "day": "%d",
+            "year": "%Y",
+            "second": "%S",
+            "hour": "%H",
+            "doy": "%j",
+            "minute": "%M",
+            "epoch": "%s",
+            "dow": "%w",
+            "week": "%W",
+        },
+    )
+
+    def visit_truediv_binary(self, binary, operator, **kw):
+        return (
+            self.process(binary.left, **kw)
+            + " / "
+            + "(%s + 0.0)" % self.process(binary.right, **kw)
+        )
+
+    def visit_now_func(self, fn, **kw):
+        return "CURRENT_TIMESTAMP"
+
+    def visit_localtimestamp_func(self, func, **kw):
+        return "DATETIME(CURRENT_TIMESTAMP, 'localtime')"
+
+    def visit_true(self, expr, **kw):
+        return "1"
+
+    def visit_false(self, expr, **kw):
+        return "0"
+
+    def visit_char_length_func(self, fn, **kw):
+        return "length%s" % self.function_argspec(fn)
+
+    def visit_aggregate_strings_func(self, fn, **kw):
+        return "group_concat%s" % self.function_argspec(fn)
+
+    def visit_cast(self, cast, **kwargs):
+        if self.dialect.supports_cast:
+            return super().visit_cast(cast, **kwargs)
+        else:
+            return self.process(cast.clause, **kwargs)
+
+    def visit_extract(self, extract, **kw):
+        try:
+            return "CAST(STRFTIME('%s', %s) AS INTEGER)" % (
+                self.extract_map[extract.field],
+                self.process(extract.expr, **kw),
+            )
+        except KeyError as err:
+            raise exc.CompileError(
+                "%s is not a valid extract argument." % extract.field
+            ) from err
+
+    def returning_clause(
+        self,
+        stmt,
+        returning_cols,
+        *,
+        populate_result_map,
+        **kw,
+    ):
+        kw["include_table"] = False
+        return super().returning_clause(
+            stmt, returning_cols, populate_result_map=populate_result_map, **kw
+        )
+
+    def limit_clause(self, select, **kw):
+        text = ""
+        if select._limit_clause is not None:
+            text += "\n LIMIT " + self.process(select._limit_clause, **kw)
+        if select._offset_clause is not None:
+            if select._limit_clause is None:
+                text += "\n LIMIT " + self.process(sql.literal(-1))
+            text += " OFFSET " + self.process(select._offset_clause, **kw)
+        else:
+            text += " OFFSET " + self.process(sql.literal(0), **kw)
+        return text
+
+    def for_update_clause(self, select, **kw):
+        # sqlite has no "FOR UPDATE" AFAICT
+        return ""
+
+    def update_from_clause(
+        self, update_stmt, from_table, extra_froms, from_hints, **kw
+    ):
+        kw["asfrom"] = True
+        return "FROM " + ", ".join(
+            t._compiler_dispatch(self, fromhints=from_hints, **kw)
+            for t in extra_froms
+        )
+
+    def visit_is_distinct_from_binary(self, binary, operator, **kw):
+        return "%s IS NOT %s" % (
+            self.process(binary.left),
+            self.process(binary.right),
+        )
+
+    def visit_is_not_distinct_from_binary(self, binary, operator, **kw):
+        return "%s IS %s" % (
+            self.process(binary.left),
+            self.process(binary.right),
+        )
+
+    def visit_json_getitem_op_binary(self, binary, operator, **kw):
+        if binary.type._type_affinity is sqltypes.JSON:
+            expr = "JSON_QUOTE(JSON_EXTRACT(%s, %s))"
+        else:
+            expr = "JSON_EXTRACT(%s, %s)"
+
+        return expr % (
+            self.process(binary.left, **kw),
+            self.process(binary.right, **kw),
+        )
+
+    def visit_json_path_getitem_op_binary(self, binary, operator, **kw):
+        if binary.type._type_affinity is sqltypes.JSON:
+            expr = "JSON_QUOTE(JSON_EXTRACT(%s, %s))"
+        else:
+            expr = "JSON_EXTRACT(%s, %s)"
+
+        return expr % (
+            self.process(binary.left, **kw),
+            self.process(binary.right, **kw),
+        )
+
+    def visit_empty_set_op_expr(self, type_, expand_op, **kw):
+        # slightly old SQLite versions don't seem to be able to handle
+        # the empty set impl
+        return self.visit_empty_set_expr(type_)
+
+    def visit_empty_set_expr(self, element_types, **kw):
+        return "SELECT %s FROM (SELECT %s) WHERE 1!=1" % (
+            ", ".join("1" for type_ in element_types or [INTEGER()]),
+            ", ".join("1" for type_ in element_types or [INTEGER()]),
+        )
+
+    def visit_regexp_match_op_binary(self, binary, operator, **kw):
+        return self._generate_generic_binary(binary, " REGEXP ", **kw)
+
+    def visit_not_regexp_match_op_binary(self, binary, operator, **kw):
+        return self._generate_generic_binary(binary, " NOT REGEXP ", **kw)
+
+    def _on_conflict_target(self, clause, **kw):
+        if clause.inferred_target_elements is not None:
+            target_text = "(%s)" % ", ".join(
+                (
+                    self.preparer.quote(c)
+                    if isinstance(c, str)
+                    else self.process(c, include_table=False, use_schema=False)
+                )
+                for c in clause.inferred_target_elements
+            )
+            if clause.inferred_target_whereclause is not None:
+                whereclause_kw = dict(kw)
+                whereclause_kw.update(
+                    include_table=False,
+                    use_schema=False,
+                    literal_execute=True,
+                )
+                target_text += " WHERE %s" % self.process(
+                    clause.inferred_target_whereclause,
+                    **whereclause_kw,
+                )
+
+        else:
+            target_text = ""
+
+        return target_text
+
+    def visit_on_conflict_do_nothing(self, on_conflict, **kw):
+        target_text = self._on_conflict_target(on_conflict, **kw)
+
+        if target_text:
+            return "ON CONFLICT %s DO NOTHING" % target_text
+        else:
+            return "ON CONFLICT DO NOTHING"
+
+    def visit_on_conflict_do_update(self, on_conflict, **kw):
+        clause = on_conflict
+
+        target_text = self._on_conflict_target(on_conflict, **kw)
+
+        action_set_ops = []
+
+        set_parameters = dict(clause.update_values_to_set)
+        # create a list of column assignment clauses as tuples
+
+        insert_statement = self.stack[-1]["selectable"]
+        cols = insert_statement.table.c
+        set_kw = dict(kw)
+        set_kw.update(use_schema=False)
+        for c in cols:
+            col_key = c.key
+
+            if col_key in set_parameters:
+                value = set_parameters.pop(col_key)
+            elif c in set_parameters:
+                value = set_parameters.pop(c)
+            else:
+                continue
+
+            if coercions._is_literal(value):
+                value = elements.BindParameter(None, value, type_=c.type)
+
+            else:
+                if (
+                    isinstance(value, elements.BindParameter)
+                    and value.type._isnull
+                ):
+                    value = value._clone()
+                    value.type = c.type
+            value_text = self.process(
+                value.self_group(), is_upsert_set=True, **set_kw
+            )
+
+            key_text = self.preparer.quote(c.name)
+            action_set_ops.append("%s = %s" % (key_text, value_text))
+
+        # check for names that don't match columns
+        if set_parameters:
+            util.warn(
+                "Additional column names not matching "
+                "any column keys in table '%s': %s"
+                % (
+                    self.current_executable.table.name,
+                    (", ".join("'%s'" % c for c in set_parameters)),
+                )
+            )
+            for k, v in set_parameters.items():
+                key_text = (
+                    self.preparer.quote(k)
+                    if isinstance(k, str)
+                    else self.process(k, **set_kw)
+                )
+                value_text = self.process(
+                    coercions.expect(roles.ExpressionElementRole, v),
+                    is_upsert_set=True,
+                    **set_kw,
+                )
+                action_set_ops.append("%s = %s" % (key_text, value_text))
+
+        action_text = ", ".join(action_set_ops)
+        if clause.update_whereclause is not None:
+            where_kw = dict(kw)
+            where_kw.update(include_table=True, use_schema=False)
+            action_text += " WHERE %s" % self.process(
+                clause.update_whereclause, **where_kw
+            )
+
+        return "ON CONFLICT %s DO UPDATE SET %s" % (target_text, action_text)
+
+    def visit_bitwise_xor_op_binary(self, binary, operator, **kw):
+        # sqlite has no xor. Use "a XOR b" = "(a | b) - (a & b)".
+        kw["eager_grouping"] = True
+        or_ = self._generate_generic_binary(binary, " | ", **kw)
+        and_ = self._generate_generic_binary(binary, " & ", **kw)
+        return f"({or_} - {and_})"
+
+
+class SQLiteDDLCompiler(compiler.DDLCompiler):
+    def get_column_specification(self, column, **kwargs):
+        coltype = self.dialect.type_compiler_instance.process(
+            column.type, type_expression=column
+        )
+        colspec = self.preparer.format_column(column) + " " + coltype
+        default = self.get_column_default_string(column)
+        if default is not None:
+
+            if not re.match(r"""^\s*[\'\"\(]""", default) and re.match(
+                r".*\W.*", default
+            ):
+                colspec += f" DEFAULT ({default})"
+            else:
+                colspec += f" DEFAULT {default}"
+
+        if not column.nullable:
+            colspec += " NOT NULL"
+
+            on_conflict_clause = column.dialect_options["sqlite"][
+                "on_conflict_not_null"
+            ]
+            if on_conflict_clause is not None:
+                colspec += " ON CONFLICT " + on_conflict_clause
+
+        if column.primary_key:
+            if (
+                column.autoincrement is True
+                and len(column.table.primary_key.columns) != 1
+            ):
+                raise exc.CompileError(
+                    "SQLite does not support autoincrement for "
+                    "composite primary keys"
+                )
+
+            if (
+                column.table.dialect_options["sqlite"]["autoincrement"]
+                and len(column.table.primary_key.columns) == 1
+                and issubclass(column.type._type_affinity, sqltypes.Integer)
+                and not column.foreign_keys
+            ):
+                colspec += " PRIMARY KEY"
+
+                on_conflict_clause = column.dialect_options["sqlite"][
+                    "on_conflict_primary_key"
+                ]
+                if on_conflict_clause is not None:
+                    colspec += " ON CONFLICT " + on_conflict_clause
+
+                colspec += " AUTOINCREMENT"
+
+        if column.computed is not None:
+            colspec += " " + self.process(column.computed)
+
+        return colspec
+
+    def visit_primary_key_constraint(self, constraint, **kw):
+        # for columns with sqlite_autoincrement=True,
+        # the PRIMARY KEY constraint can only be inline
+        # with the column itself.
+        if len(constraint.columns) == 1:
+            c = list(constraint)[0]
+            if (
+                c.primary_key
+                and c.table.dialect_options["sqlite"]["autoincrement"]
+                and issubclass(c.type._type_affinity, sqltypes.Integer)
+                and not c.foreign_keys
+            ):
+                return None
+
+        text = super().visit_primary_key_constraint(constraint)
+
+        on_conflict_clause = constraint.dialect_options["sqlite"][
+            "on_conflict"
+        ]
+        if on_conflict_clause is None and len(constraint.columns) == 1:
+            on_conflict_clause = list(constraint)[0].dialect_options["sqlite"][
+                "on_conflict_primary_key"
+            ]
+
+        if on_conflict_clause is not None:
+            text += " ON CONFLICT " + on_conflict_clause
+
+        return text
+
+    def visit_unique_constraint(self, constraint, **kw):
+        text = super().visit_unique_constraint(constraint)
+
+        on_conflict_clause = constraint.dialect_options["sqlite"][
+            "on_conflict"
+        ]
+        if on_conflict_clause is None and len(constraint.columns) == 1:
+            col1 = list(constraint)[0]
+            if isinstance(col1, schema.SchemaItem):
+                on_conflict_clause = list(constraint)[0].dialect_options[
+                    "sqlite"
+                ]["on_conflict_unique"]
+
+        if on_conflict_clause is not None:
+            text += " ON CONFLICT " + on_conflict_clause
+
+        return text
+
+    def visit_check_constraint(self, constraint, **kw):
+        text = super().visit_check_constraint(constraint)
+
+        on_conflict_clause = constraint.dialect_options["sqlite"][
+            "on_conflict"
+        ]
+
+        if on_conflict_clause is not None:
+            text += " ON CONFLICT " + on_conflict_clause
+
+        return text
+
+    def visit_column_check_constraint(self, constraint, **kw):
+        text = super().visit_column_check_constraint(constraint)
+
+        if constraint.dialect_options["sqlite"]["on_conflict"] is not None:
+            raise exc.CompileError(
+                "SQLite does not support on conflict clause for "
+                "column check constraint"
+            )
+
+        return text
+
+    def visit_foreign_key_constraint(self, constraint, **kw):
+        local_table = constraint.elements[0].parent.table
+        remote_table = constraint.elements[0].column.table
+
+        if local_table.schema != remote_table.schema:
             return None
         else:
-            return self._connection_record.record_info
+            return super().visit_foreign_key_constraint(constraint)
 
-    def invalidate(
-        self, e: Optional[BaseException] = None, soft: bool = False
+    def define_constraint_remote_table(self, constraint, table, preparer):
+        """Format the remote table clause of a CREATE CONSTRAINT clause."""
+
+        return preparer.format_table(table, use_schema=False)
+
+    def visit_create_index(
+        self, create, include_schema=False, include_table_schema=True, **kw
+    ):
+        index = create.element
+        self._verify_index_table(index)
+        preparer = self.preparer
+        text = "CREATE "
+        if index.unique:
+            text += "UNIQUE "
+
+        text += "INDEX "
+
+        if create.if_not_exists:
+            text += "IF NOT EXISTS "
+
+        text += "%s ON %s (%s)" % (
+            self._prepared_index_name(index, include_schema=True),
+            preparer.format_table(index.table, use_schema=False),
+            ", ".join(
+                self.sql_compiler.process(
+                    expr, include_table=False, literal_binds=True
+                )
+                for expr in index.expressions
+            ),
+        )
+
+        whereclause = index.dialect_options["sqlite"]["where"]
+        if whereclause is not None:
+            where_compiled = self.sql_compiler.process(
+                whereclause, include_table=False, literal_binds=True
+            )
+            text += " WHERE " + where_compiled
+
+        return text
+
+    def post_create_table(self, table):
+        table_options = []
+
+        if not table.dialect_options["sqlite"]["with_rowid"]:
+            table_options.append("WITHOUT ROWID")
+
+        if table.dialect_options["sqlite"]["strict"]:
+            table_options.append("STRICT")
+
+        if table_options:
+            return "\n " + ",\n ".join(table_options)
+        else:
+            return ""
+
+
+class SQLiteTypeCompiler(compiler.GenericTypeCompiler):
+    def visit_large_binary(self, type_, **kw):
+        return self.visit_BLOB(type_)
+
+    def visit_DATETIME(self, type_, **kw):
+        if (
+            not isinstance(type_, _DateTimeMixin)
+            or type_.format_is_text_affinity
+        ):
+            return super().visit_DATETIME(type_)
+        else:
+            return "DATETIME_CHAR"
+
+    def visit_DATE(self, type_, **kw):
+        if (
+            not isinstance(type_, _DateTimeMixin)
+            or type_.format_is_text_affinity
+        ):
+            return super().visit_DATE(type_)
+        else:
+            return "DATE_CHAR"
+
+    def visit_TIME(self, type_, **kw):
+        if (
+            not isinstance(type_, _DateTimeMixin)
+            or type_.format_is_text_affinity
+        ):
+            return super().visit_TIME(type_)
+        else:
+            return "TIME_CHAR"
+
+    def visit_JSON(self, type_, **kw):
+        # note this name provides NUMERIC affinity, not TEXT.
+        # should not be an issue unless the JSON value consists of a single
+        # numeric value.   JSONTEXT can be used if this case is required.
+        return "JSON"
+
+
+class SQLiteIdentifierPreparer(compiler.IdentifierPreparer):
+    reserved_words = {
+        "add",
+        "after",
+        "all",
+        "alter",
+        "analyze",
+        "and",
+        "as",
+        "asc",
+        "attach",
+        "autoincrement",
+        "before",
+        "begin",
+        "between",
+        "by",
+        "cascade",
+        "case",
+        "cast",
+        "check",
+        "collate",
+        "column",
+        "commit",
+        "conflict",
+        "constraint",
+        "create",
+        "cross",
+        "current_date",
+        "current_time",
+        "current_timestamp",
+        "database",
+        "default",
+        "deferrable",
+        "deferred",
+        "delete",
+        "desc",
+        "detach",
+        "distinct",
+        "drop",
+        "each",
+        "else",
+        "end",
+        "escape",
+        "except",
+        "exclusive",
+        "exists",
+        "explain",
+        "false",
+        "fail",
+        "for",
+        "foreign",
+        "from",
+        "full",
+        "glob",
+        "group",
+        "having",
+        "if",
+        "ignore",
+        "immediate",
+        "in",
+        "index",
+        "indexed",
+        "initially",
+        "inner",
+        "insert",
+        "instead",
+        "intersect",
+        "into",
+        "is",
+        "isnull",
+        "join",
+        "key",
+        "left",
+        "like",
+        "limit",
+        "match",
+        "natural",
+        "not",
+        "notnull",
+        "null",
+        "of",
+        "offset",
+        "on",
+        "or",
+        "order",
+        "outer",
+        "plan",
+        "pragma",
+        "primary",
+        "query",
+        "raise",
+        "references",
+        "reindex",
+        "rename",
+        "replace",
+        "restrict",
+        "right",
+        "rollback",
+        "row",
+        "select",
+        "set",
+        "table",
+        "temp",
+        "temporary",
+        "then",
+        "to",
+        "transaction",
+        "trigger",
+        "true",
+        "union",
+        "unique",
+        "update",
+        "using",
+        "vacuum",
+        "values",
+        "view",
+        "virtual",
+        "when",
+        "where",
+    }
+
+
+class SQLiteExecutionContext(default.DefaultExecutionContext):
+    @util.memoized_property
+    def _preserve_raw_colnames(self):
+        return (
+            not self.dialect._broken_dotted_colnames
+            or self.execution_options.get("sqlite_raw_colnames", False)
+        )
+
+    def _translate_colname(self, colname):
+        # TODO: detect SQLite version 3.10.0 or greater;
+        # see [ticket:3633]
+
+        # adjust for dotted column names.  SQLite
+        # in the case of UNION may store col names as
+        # "tablename.colname", or if using an attached database,
+        # "database.tablename.colname", in cursor.description
+        if not self._preserve_raw_colnames and "." in colname:
+            return colname.split(".")[-1], colname
+        else:
+            return colname, None
+
+
+class SQLiteDialect(default.DefaultDialect):
+    name = "sqlite"
+    supports_alter = False
+
+    # SQlite supports "DEFAULT VALUES" but *does not* support
+    # "VALUES (DEFAULT)"
+    supports_default_values = True
+    supports_default_metavalue = False
+
+    # sqlite issue:
+    # https://github.com/python/cpython/issues/93421
+    # note this parameter is no longer used by the ORM or default dialect
+    # see #9414
+    supports_sane_rowcount_returning = False
+
+    supports_empty_insert = False
+    supports_cast = True
+    supports_multivalues_insert = True
+    use_insertmanyvalues = True
+    tuple_in_values = True
+    supports_statement_cache = True
+    insert_null_pk_still_autoincrements = True
+    insert_returning = True
+    update_returning = True
+    update_returning_multifrom = True
+    delete_returning = True
+    update_returning_multifrom = True
+
+    supports_default_metavalue = True
+    """dialect supports INSERT... VALUES (DEFAULT) syntax"""
+
+    default_metavalue_token = "NULL"
+    """for INSERT... VALUES (DEFAULT) syntax, the token to put in the
+    parenthesis."""
+
+    default_paramstyle = "qmark"
+    execution_ctx_cls = SQLiteExecutionContext
+    statement_compiler = SQLiteCompiler
+    ddl_compiler = SQLiteDDLCompiler
+    type_compiler_cls = SQLiteTypeCompiler
+    preparer = SQLiteIdentifierPreparer
+    ischema_names = ischema_names
+    colspecs = colspecs
+
+    construct_arguments = [
+        (
+            sa_schema.Table,
+            {
+                "autoincrement": False,
+                "with_rowid": True,
+                "strict": False,
+            },
+        ),
+        (sa_schema.Index, {"where": None}),
+        (
+            sa_schema.Column,
+            {
+                "on_conflict_primary_key": None,
+                "on_conflict_not_null": None,
+                "on_conflict_unique": None,
+            },
+        ),
+        (sa_schema.Constraint, {"on_conflict": None}),
+    ]
+
+    _broken_fk_pragma_quotes = False
+    _broken_dotted_colnames = False
+
+    @util.deprecated_params(
+        _json_serializer=(
+            "1.3.7",
+            "The _json_serializer argument to the SQLite dialect has "
+            "been renamed to the correct name of json_serializer.  The old "
+            "argument name will be removed in a future release.",
+        ),
+        _json_deserializer=(
+            "1.3.7",
+            "The _json_deserializer argument to the SQLite dialect has "
+            "been renamed to the correct name of json_deserializer.  The old "
+            "argument name will be removed in a future release.",
+        ),
+    )
+    def __init__(
+        self,
+        native_datetime: bool = False,
+        json_serializer: Optional[Callable[..., Any]] = None,
+        json_deserializer: Optional[Callable[..., Any]] = None,
+        _json_serializer: Optional[Callable[..., Any]] = None,
+        _json_deserializer: Optional[Callable[..., Any]] = None,
+        **kwargs: Any,
     ) -> None:
-        if self.dbapi_connection is None:
-            util.warn("Can't invalidate an already-closed connection.")
-            return
-        if self._connection_record:
-            self._connection_record.invalidate(e=e, soft=soft)
-        if not soft:
-            # prevent any rollback / reset actions etc. on
-            # the connection
-            self.dbapi_connection = None  # type: ignore
+        default.DefaultDialect.__init__(self, **kwargs)
 
-            # finalize
-            self._checkin()
+        if _json_serializer:
+            json_serializer = _json_serializer
+        if _json_deserializer:
+            json_deserializer = _json_deserializer
+        self._json_serializer = json_serializer
+        self._json_deserializer = json_deserializer
 
-    def cursor(self, *args: Any, **kwargs: Any) -> DBAPICursor:
-        assert self.dbapi_connection is not None
-        return self.dbapi_connection.cursor(*args, **kwargs)
+        # this flag used by pysqlite dialect, and perhaps others in the
+        # future, to indicate the driver is handling date/timestamp
+        # conversions (and perhaps datetime/time as well on some hypothetical
+        # driver ?)
+        self.native_datetime = native_datetime
 
-    def __getattr__(self, key: str) -> Any:
-        return getattr(self.dbapi_connection, key)
+        if self.dbapi is not None:
+            if self.dbapi.sqlite_version_info < (3, 7, 16):
+                util.warn(
+                    "SQLite version %s is older than 3.7.16, and will not "
+                    "support right nested joins, as are sometimes used in "
+                    "more complex ORM scenarios.  SQLAlchemy 1.4 and above "
+                    "no longer tries to rewrite these joins."
+                    % (self.dbapi.sqlite_version_info,)
+                )
 
-    def detach(self) -> None:
-        if self._connection_record is not None:
-            rec = self._connection_record
-            rec.fairy_ref = None
-            rec.dbapi_connection = None
-            # TODO: should this be _return_conn?
-            self._pool._do_return_conn(self._connection_record)
+            # NOTE: python 3.7 on fedora for me has SQLite 3.34.1.  These
+            # version checks are getting very stale.
+            self._broken_dotted_colnames = self.dbapi.sqlite_version_info < (
+                3,
+                10,
+                0,
+            )
+            self.supports_default_values = self.dbapi.sqlite_version_info >= (
+                3,
+                3,
+                8,
+            )
+            self.supports_cast = self.dbapi.sqlite_version_info >= (3, 2, 3)
+            self.supports_multivalues_insert = (
+                # https://www.sqlite.org/releaselog/3_7_11.html
+                self.dbapi.sqlite_version_info
+                >= (3, 7, 11)
+            )
+            # see https://www.sqlalchemy.org/trac/ticket/2568
+            # as well as https://www.sqlite.org/src/info/600482d161
+            self._broken_fk_pragma_quotes = self.dbapi.sqlite_version_info < (
+                3,
+                6,
+                14,
+            )
 
-            # can't get the descriptor assignment to work here
-            # in pylance.  mypy is OK w/ it
-            self.info = self.info.copy()  # type: ignore
+            if self.dbapi.sqlite_version_info < (3, 35):
+                self.update_returning = self.delete_returning = (
+                    self.insert_returning
+                ) = False
 
-            self._connection_record = None
+            if self.dbapi.sqlite_version_info < (3, 32, 0):
+                # https://www.sqlite.org/limits.html
+                self.insertmanyvalues_max_parameters = 999
 
-            if self._pool.dispatch.detach:
-                self._pool.dispatch.detach(self.dbapi_connection, rec)
+    _isolation_lookup = util.immutabledict(
+        {"READ UNCOMMITTED": 1, "SERIALIZABLE": 0}
+    )
 
-    def close(self) -> None:
-        self._counter -= 1
-        if self._counter == 0:
-            self._checkin()
+    def get_isolation_level_values(self, dbapi_connection):
+        return list(self._isolation_lookup)
 
-    def _close_special(self, transaction_reset: bool = False) -> None:
-        self._counter -= 1
-        if self._counter == 0:
-            self._checkin(transaction_was_reset=transaction_reset)
+    def set_isolation_level(
+        self, dbapi_connection: DBAPIConnection, level: IsolationLevel
+    ) -> None:
+        isolation_level = self._isolation_lookup[level]
+
+        cursor = dbapi_connection.cursor()
+        cursor.execute(f"PRAGMA read_uncommitted = {isolation_level}")
+        cursor.close()
+
+    def get_isolation_level(self, dbapi_connection):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA read_uncommitted")
+        res = cursor.fetchone()
+        if res:
+            value = res[0]
+        else:
+            # https://www.sqlite.org/changes.html#version_3_3_3
+            # "Optional READ UNCOMMITTED isolation (instead of the
+            # default isolation level of SERIALIZABLE) and
+            # table level locking when database connections
+            # share a common cache.""
+            # pre-SQLite 3.3.0 default to 0
+            value = 0
+        cursor.close()
+        if value == 0:
+            return "SERIALIZABLE"
+        elif value == 1:
+            return "READ UNCOMMITTED"
+        else:
+            assert False, "Unknown isolation level %s" % value
+
+    @reflection.cache
+    def get_schema_names(self, connection, **kw):
+        s = "PRAGMA database_list"
+        dl = connection.exec_driver_sql(s)
+
+        return [db[1] for db in dl if db[1] != "temp"]
+
+    def _format_schema(self, schema, table_name):
+        if schema is not None:
+            qschema = self.identifier_preparer.quote_identifier(schema)
+            name = f"{qschema}.{table_name}"
+        else:
+            name = table_name
+        return name
+
+    def _sqlite_main_query(
+        self,
+        table: str,
+        type_: str,
+        schema: Optional[str],
+        sqlite_include_internal: bool,
+    ):
+        main = self._format_schema(schema, table)
+        if not sqlite_include_internal:
+            filter_table = " AND name NOT LIKE 'sqlite~_%' ESCAPE '~'"
+        else:
+            filter_table = ""
+        query = (
+            f"SELECT name FROM {main} "
+            f"WHERE type='{type_}'{filter_table} "
+            "ORDER BY name"
+        )
+        return query
+
+    @reflection.cache
+    def get_table_names(
+        self, connection, schema=None, sqlite_include_internal=False, **kw
+    ):
+        query = self._sqlite_main_query(
+            "sqlite_master", "table", schema, sqlite_include_internal
+        )
+        names = connection.exec_driver_sql(query).scalars().all()
+        return names
+
+    @reflection.cache
+    def get_temp_table_names(
+        self, connection, sqlite_include_internal=False, **kw
+    ):
+        query = self._sqlite_main_query(
+            "sqlite_temp_master", "table", None, sqlite_include_internal
+        )
+        names = connection.exec_driver_sql(query).scalars().all()
+        return names
+
+    @reflection.cache
+    def get_temp_view_names(
+        self, connection, sqlite_include_internal=False, **kw
+    ):
+        query = self._sqlite_main_query(
+            "sqlite_temp_master", "view", None, sqlite_include_internal
+        )
+        names = connection.exec_driver_sql(query).scalars().all()
+        return names
+
+    @reflection.cache
+    def has_table(self, connection, table_name, schema=None, **kw):
+        self._ensure_has_table_connection(connection)
+
+        if schema is not None and schema not in self.get_schema_names(
+            connection, **kw
+        ):
+            return False
+
+        info = self._get_table_pragma(
+            connection, "table_info", table_name, schema=schema
+        )
+        return bool(info)
+
+    def _get_default_schema_name(self, connection):
+        return "main"
+
+    @reflection.cache
+    def get_view_names(
+        self, connection, schema=None, sqlite_include_internal=False, **kw
+    ):
+        query = self._sqlite_main_query(
+            "sqlite_master", "view", schema, sqlite_include_internal
+        )
+        names = connection.exec_driver_sql(query).scalars().all()
+        return names
+
+    @reflection.cache
+    def get_view_definition(self, connection, view_name, schema=None, **kw):
+        if schema is not None:
+            qschema = self.identifier_preparer.quote_identifier(schema)
+            master = f"{qschema}.sqlite_master"
+            s = ("SELECT sql FROM %s WHERE name = ? AND type='view'") % (
+                master,
+            )
+            rs = connection.exec_driver_sql(s, (view_name,))
+        else:
+            try:
+                s = (
+                    "SELECT sql FROM "
+                    " (SELECT * FROM sqlite_master UNION ALL "
+                    "  SELECT * FROM sqlite_temp_master) "
+                    "WHERE name = ? "
+                    "AND type='view'"
+                )
+                rs = connection.exec_driver_sql(s, (view_name,))
+            except exc.DBAPIError:
+                s = (
+                    "SELECT sql FROM sqlite_master WHERE name = ? "
+                    "AND type='view'"
+                )
+                rs = connection.exec_driver_sql(s, (view_name,))
+
+        result = rs.fetchall()
+        if result:
+            return result[0].sql
+        else:
+            raise exc.NoSuchTableError(
+                f"{schema}.{view_name}" if schema else view_name
+            )
+
+    @reflection.cache
+    def get_columns(self, connection, table_name, schema=None, **kw):
+        pragma = "table_info"
+        # computed columns are threaded as hidden, they require table_xinfo
+        if self.server_version_info >= (3, 31):
+            pragma = "table_xinfo"
+        info = self._get_table_pragma(
+            connection, pragma, table_name, schema=schema
+        )
+        columns = []
+        tablesql = None
+        for row in info:
+            name = row[1]
+            type_ = row[2].upper()
+            nullable = not row[3]
+            default = row[4]
+            primary_key = row[5]
+            hidden = row[6] if pragma == "table_xinfo" else 0
+
+            # hidden has value 0 for normal columns, 1 for hidden columns,
+            # 2 for computed virtual columns and 3 for computed stored columns
+            # https://www.sqlite.org/src/info/069351b85f9a706f60d3e98fbc8aaf40c374356b967c0464aede30ead3d9d18b
+            if hidden == 1:
+                continue
+
+            generated = bool(hidden)
+            persisted = hidden == 3
+
+            if tablesql is None and generated:
+                tablesql = self._get_table_sql(
+                    connection, table_name, schema, **kw
+                )
+                # remove create table
+                match = re.match(
+                    (
+                        r"create table .*?\((.*)\)"
+                        r"(?:\s*,?\s*(?:WITHOUT\s+ROWID|STRICT))*$"
+                    ),
+                    tablesql.strip(),
+                    re.DOTALL | re.IGNORECASE,
+                )
+                assert match, f"create table not found in {tablesql}"
+                tablesql = match.group(1).strip()
+
+            columns.append(
+                self._get_column_info(
+                    name,
+                    type_,
+                    nullable,
+                    default,
+                    primary_key,
+                    generated,
+                    persisted,
+                    tablesql,
+                )
+            )
+        if columns:
+            return columns
+        elif not self.has_table(connection, table_name, schema):
+            raise exc.NoSuchTableError(
+                f"{schema}.{table_name}" if schema else table_name
+            )
+        else:
+            return ReflectionDefaults.columns()
+
+    def _get_column_info(
+        self,
+        name,
+        type_,
+        nullable,
+        default,
+        primary_key,
+        generated,
+        persisted,
+        tablesql,
+    ):
+        if generated:
+            # the type of a column "cc INTEGER GENERATED ALWAYS AS (1 + 42)"
+            # somehow is "INTEGER GENERATED ALWAYS"
+            type_ = re.sub("generated", "", type_, flags=re.IGNORECASE)
+            type_ = re.sub("always", "", type_, flags=re.IGNORECASE).strip()
+
+        coltype = self._resolve_type_affinity(type_)
+
+        if default is not None:
+            default = str(default)
+
+        colspec = {
+            "name": name,
+            "type": coltype,
+            "nullable": nullable,
+            "default": default,
+            "primary_key": primary_key,
+        }
+        if generated:
+            sqltext = ""
+            if tablesql:
+                pattern = (
+                    r"[^,]*\s+GENERATED\s+ALWAYS\s+AS"
+                    r"\s+\((.*)\)\s*(?:virtual|stored)?"
+                )
+                match = re.search(
+                    re.escape(name) + pattern, tablesql, re.IGNORECASE
+                )
+                if match:
+                    sqltext = match.group(1)
+            colspec["computed"] = {"sqltext": sqltext, "persisted": persisted}
+        return colspec
+
+    def _resolve_type_affinity(self, type_):
+        """Return a data type from a reflected column, using affinity rules.
+
+        SQLite's goal for universal compatibility introduces some complexity
+        during reflection, as a column's defined type might not actually be a
+        type that SQLite understands - or indeed, my not be defined *at all*.
+        Internally, SQLite handles this with a 'data type affinity' for each
+        column definition, mapping to one of 'TEXT', 'NUMERIC', 'INTEGER',
+        'REAL', or 'NONE' (raw bits). The algorithm that determines this is
+        listed in https://www.sqlite.org/datatype3.html section 2.1.
+
+        This method allows SQLAlchemy to support that algorithm, while still
+        providing access to smarter reflection utilities by recognizing
+        column definitions that SQLite only supports through affinity (like
+        DATE and DOUBLE).
+
+        """
+        match = re.match(r"([\w ]+)(\(.*?\))?", type_)
+        if match:
+            coltype = match.group(1)
+            args = match.group(2)
+        else:
+            coltype = ""
+            args = ""
+
+        if coltype in self.ischema_names:
+            coltype = self.ischema_names[coltype]
+        elif "INT" in coltype:
+            coltype = sqltypes.INTEGER
+        elif "CHAR" in coltype or "CLOB" in coltype or "TEXT" in coltype:
+            coltype = sqltypes.TEXT
+        elif "BLOB" in coltype or not coltype:
+            coltype = sqltypes.NullType
+        elif "REAL" in coltype or "FLOA" in coltype or "DOUB" in coltype:
+            coltype = sqltypes.REAL
+        else:
+            coltype = sqltypes.NUMERIC
+
+        if args is not None:
+            args = re.findall(r"(\d+)", args)
+            try:
+                coltype = coltype(*[int(a) for a in args])
+            except TypeError:
+                util.warn(
+                    "Could not instantiate type %s with "
+                    "reflected arguments %s; using no arguments."
+                    % (coltype, args)
+                )
+                coltype = coltype()
+        else:
+            coltype = coltype()
+
+        return coltype
+
+    @reflection.cache
+    def get_pk_constraint(self, connection, table_name, schema=None, **kw):
+        constraint_name = None
+        table_data = self._get_table_sql(connection, table_name, schema=schema)
+        if table_data:
+            PK_PATTERN = r'CONSTRAINT +(?:"(.+?)"|(\w+)) +PRIMARY KEY'
+            result = re.search(PK_PATTERN, table_data, re.I)
+            if result:
+                constraint_name = result.group(1) or result.group(2)
+            else:
+                constraint_name = None
+
+        cols = self.get_columns(connection, table_name, schema, **kw)
+        # consider only pk columns. This also avoids sorting the cached
+        # value returned by get_columns
+        cols = [col for col in cols if col.get("primary_key", 0) > 0]
+        cols.sort(key=lambda col: col.get("primary_key"))
+        pkeys = [col["name"] for col in cols]
+
+        if pkeys:
+            return {"constrained_columns": pkeys, "name": constraint_name}
+        else:
+            return ReflectionDefaults.pk_constraint()
+
+    @reflection.cache
+    def get_foreign_keys(self, connection, table_name, schema=None, **kw):
+        # sqlite makes this *extremely difficult*.
+        # First, use the pragma to get the actual FKs.
+        pragma_fks = self._get_table_pragma(
+            connection, "foreign_key_list", table_name, schema=schema
+        )
+
+        fks = {}
+
+        for row in pragma_fks:
+            numerical_id, rtbl, lcol, rcol = (row[0], row[2], row[3], row[4])
+
+            if not rcol:
+                # no referred column, which means it was not named in the
+                # original DDL.  The referred columns of the foreign key
+                # constraint are therefore the primary key of the referred
+                # table.
+                try:
+                    referred_pk = self.get_pk_constraint(
+                        connection, rtbl, schema=schema, **kw
+                    )
+                    referred_columns = referred_pk["constrained_columns"]
+                except exc.NoSuchTableError:
+                    # ignore not existing parents
+                    referred_columns = []
+            else:
+                # note we use this list only if this is the first column
+                # in the constraint.  for subsequent columns we ignore the
+                # list and append "rcol" if present.
+                referred_columns = []
+
+            if self._broken_fk_pragma_quotes:
+                rtbl = re.sub(r"^[\"\[`\']|[\"\]`\']$", "", rtbl)
+
+            if numerical_id in fks:
+                fk = fks[numerical_id]
+            else:
+                fk = fks[numerical_id] = {
+                    "name": None,
+                    "constrained_columns": [],
+                    "referred_schema": schema,
+                    "referred_table": rtbl,
+                    "referred_columns": referred_columns,
+                    "options": {},
+                }
+                fks[numerical_id] = fk
+
+            fk["constrained_columns"].append(lcol)
+
+            if rcol:
+                fk["referred_columns"].append(rcol)
+
+        def fk_sig(constrained_columns, referred_table, referred_columns):
+            return (
+                tuple(constrained_columns)
+                + (referred_table,)
+                + tuple(referred_columns)
+            )
+
+        # then, parse the actual SQL and attempt to find DDL that matches
+        # the names as well.   SQLite saves the DDL in whatever format
+        # it was typed in as, so need to be liberal here.
+
+        keys_by_signature = {
+            fk_sig(
+                fk["constrained_columns"],
+                fk["referred_table"],
+                fk["referred_columns"],
+            ): fk
+            for fk in fks.values()
+        }
+
+        table_data = self._get_table_sql(connection, table_name, schema=schema)
+
+        def parse_fks():
+            if table_data is None:
+                # system tables, etc.
+                return
+
+            # note that we already have the FKs from PRAGMA above.  This whole
+            # regexp thing is trying to locate additional detail about the
+            # FKs, namely the name of the constraint and other options.
+            # so parsing the columns is really about matching it up to what
+            # we already have.
+            FK_PATTERN = (
+                r'(?:CONSTRAINT +(?:"(.+?)"|(\w+)) +)?'
+                r"FOREIGN KEY *\( *(.+?) *\) +"
+                r'REFERENCES +(?:(?:"(.+?)")|([a-z0-9_]+)) *\( *((?:(?:"[^"]+"|[a-z0-9_]+) *(?:, *)?)+)\) *'  # noqa: E501
+                r"((?:ON (?:DELETE|UPDATE) "
+                r"(?:SET NULL|SET DEFAULT|CASCADE|RESTRICT|NO ACTION) *)*)"
+                r"((?:NOT +)?DEFERRABLE)?"
+                r"(?: +INITIALLY +(DEFERRED|IMMEDIATE))?"
+            )
+            for match in re.finditer(FK_PATTERN, table_data, re.I):
+                (
+                    constraint_quoted_name,
+                    constraint_name,
+                    constrained_columns,
+                    referred_quoted_name,
+                    referred_name,
+                    referred_columns,
+                    onupdatedelete,
+                    deferrable,
+                    initially,
+                ) = match.group(1, 2, 3, 4, 5, 6, 7, 8, 9)
+                constraint_name = constraint_quoted_name or constraint_name
+                constrained_columns = list(
+                    self._find_cols_in_sig(constrained_columns)
+                )
+                if not referred_columns:
+                    referred_columns = constrained_columns
+                else:
+                    referred_columns = list(
+                        self._find_cols_in_sig(referred_columns)
+                    )
+                referred_name = referred_quoted_name or referred_name
+                options = {}
+
+                for token in re.split(r" *\bON\b *", onupdatedelete.upper()):
+                    if token.startswith("DELETE"):
+                        ondelete = token[6:].strip()
+                        if ondelete and ondelete != "NO ACTION":
+                            options["ondelete"] = ondelete
+                    elif token.startswith("UPDATE"):
+                        onupdate = token[6:].strip()
+                        if onupdate and onupdate != "NO ACTION":
+                            options["onupdate"] = onupdate
+
+                if deferrable:
+                    options["deferrable"] = "NOT" not in deferrable.upper()
+                if initially:
+                    options["initially"] = initially.upper()
+
+                yield (
+                    constraint_name,
+                    constrained_columns,
+                    referred_name,
+                    referred_columns,
+                    options,
+                )
+
+        fkeys = []
+
+        for (
+            constraint_name,
+            constrained_columns,
+            referred_name,
+            referred_columns,
+            options,
+        ) in parse_fks():
+            sig = fk_sig(constrained_columns, referred_name, referred_columns)
+            if sig not in keys_by_signature:
+                util.warn(
+                    "WARNING: SQL-parsed foreign key constraint "
+                    "'%s' could not be located in PRAGMA "
+                    "foreign_keys for table %s" % (sig, table_name)
+                )
+                continue
+            key = keys_by_signature.pop(sig)
+            key["name"] = constraint_name
+            key["options"] = options
+            fkeys.append(key)
+        # assume the remainders are the unnamed, inline constraints, just
+        # use them as is as it's extremely difficult to parse inline
+        # constraints
+        fkeys.extend(keys_by_signature.values())
+        if fkeys:
+            return fkeys
+        else:
+            return ReflectionDefaults.foreign_keys()
+
+    def _find_cols_in_sig(self, sig):
+        for match in re.finditer(r'(?:"(.+?)")|([a-z0-9_]+)', sig, re.I):
+            yield match.group(1) or match.group(2)
+
+    @reflection.cache
+    def get_unique_constraints(
+        self, connection, table_name, schema=None, **kw
+    ):
+        auto_index_by_sig = {}
+        for idx in self.get_indexes(
+            connection,
+            table_name,
+            schema=schema,
+            include_auto_indexes=True,
+            **kw,
+        ):
+            if not idx["name"].startswith("sqlite_autoindex"):
+                continue
+            sig = tuple(idx["column_names"])
+            auto_index_by_sig[sig] = idx
+
+        table_data = self._get_table_sql(
+            connection, table_name, schema=schema, **kw
+        )
+        unique_constraints = []
+
+        def parse_uqs():
+            if table_data is None:
+                return
+            UNIQUE_PATTERN = (
+                r'(?:CONSTRAINT +(?:"(.+?)"|(\w+)) +)?UNIQUE *\((.+?)\)'
+            )
+            INLINE_UNIQUE_PATTERN = (
+                r'(?:(".+?")|(?:[\[`])?([a-z0-9_]+)(?:[\]`])?)[\t ]'
+                r"+[a-z0-9_ ]+?[\t ]+UNIQUE"
+            )
+
+            for match in re.finditer(UNIQUE_PATTERN, table_data, re.I):
+                quoted_name, unquoted_name, cols = match.group(1, 2, 3)
+                name = quoted_name or unquoted_name
+                yield name, list(self._find_cols_in_sig(cols))
+
+            # we need to match inlines as well, as we seek to differentiate
+            # a UNIQUE constraint from a UNIQUE INDEX, even though these
+            # are kind of the same thing :)
+            for match in re.finditer(INLINE_UNIQUE_PATTERN, table_data, re.I):
+                cols = list(
+                    self._find_cols_in_sig(match.group(1) or match.group(2))
+                )
+                yield None, cols
+
+        for name, cols in parse_uqs():
+            sig = tuple(cols)
+            if sig in auto_index_by_sig:
+                auto_index_by_sig.pop(sig)
+                parsed_constraint = {"name": name, "column_names": cols}
+                unique_constraints.append(parsed_constraint)
+        # NOTE: auto_index_by_sig might not be empty here,
+        # the PRIMARY KEY may have an entry.
+        if unique_constraints:
+            return unique_constraints
+        else:
+            return ReflectionDefaults.unique_constraints()
+
+    @reflection.cache
+    def get_check_constraints(self, connection, table_name, schema=None, **kw):
+        table_data = self._get_table_sql(
+            connection, table_name, schema=schema, **kw
+        )
+
+        # Extract CHECK constraints by properly handling balanced parentheses
+        # and avoiding false matches when CHECK/CONSTRAINT appear in table
+        # names. See #12924 for context.
+        #
+        # SQLite supports 4 identifier quote styles (see
+        # sqlite.org/lang_keywords.html):
+        # - Double quotes "..." (standard SQL)
+        # - Brackets [...] (MS Access/SQL Server compatibility)
+        # - Backticks `...` (MySQL compatibility)
+        # - Single quotes '...' (SQLite extension)
+        #
+        # NOTE: there is not currently a way to parse CHECK constraints that
+        # contain newlines as the approach here relies upon each individual
+        # CHECK constraint being on a single line by itself.   This necessarily
+        # makes assumptions as to how the CREATE TABLE was emitted.
+        CHECK_PATTERN = re.compile(
+            r"""
+            (?<![A-Za-z0-9_])   # Negative lookbehind: ensure CHECK is not
+                                # part of an identifier (e.g., table name
+                                # like "tableCHECK")
+
+            (?:                 # Optional CONSTRAINT clause
+                CONSTRAINT\s+
+                (               # Group 1: Constraint name (quoted or unquoted)
+                    "(?:[^"]|"")+"        # Double-quoted: "name" or "na""me"
+                    |'(?:[^']|'')+'  # Single-quoted: 'name' or 'na''me'
+                    |\[(?:[^\]]|\]\])+\]  # Bracket-quoted: [name] or [na]]me]
+                    |`(?:[^`]|``)+`       # Backtick-quoted: `name` or `na``me`
+                    |\S+                  # Unquoted: simple_name
+                )
+                \s+
+            )?
+
+            CHECK\s*\(          # CHECK keyword followed by opening paren
+            """,
+            re.VERBOSE | re.IGNORECASE,
+        )
+        cks = []
+
+        for match in re.finditer(CHECK_PATTERN, table_data or ""):
+            constraint_name = match.group(1)
+
+            if constraint_name:
+                # Remove surrounding quotes if present
+                # Double quotes: "name" -> name
+                # Single quotes: 'name' -> name
+                # Brackets: [name] -> name
+                # Backticks: `name` -> name
+                constraint_name = re.sub(
+                    r'^(["\'`])(.+)\1$|^\[(.+)\]$',
+                    lambda m: m.group(2) or m.group(3),
+                    constraint_name,
+                    flags=re.DOTALL,
+                )
+
+            # Find the matching closing parenthesis by counting balanced parens
+            # Must track string context to ignore parens inside string literals
+            start = match.end()  # Position after 'CHECK ('
+            paren_count = 1
+            in_single_quote = False
+            in_double_quote = False
+
+            for pos, char in enumerate(table_data[start:], start):
+                # Track string literal context
+                if char == "'" and not in_double_quote:
+                    in_single_quote = not in_single_quote
+                elif char == '"' and not in_single_quote:
+                    in_double_quote = not in_double_quote
+                # Only count parens when not inside a string literal
+                elif not in_single_quote and not in_double_quote:
+                    if char == "(":
+                        paren_count += 1
+                    elif char == ")":
+                        paren_count -= 1
+                        if paren_count == 0:
+                            # Successfully found matching closing parenthesis
+                            sqltext = table_data[start:pos].strip()
+                            cks.append(
+                                {"sqltext": sqltext, "name": constraint_name}
+                            )
+                            break
+
+        cks.sort(key=lambda d: d["name"] or "~")  # sort None as last
+        if cks:
+            return cks
+        else:
+            return ReflectionDefaults.check_constraints()
+
+    @reflection.cache
+    def get_indexes(self, connection, table_name, schema=None, **kw):
+        pragma_indexes = self._get_table_pragma(
+            connection, "index_list", table_name, schema=schema
+        )
+        indexes = []
+
+        # regular expression to extract the filter predicate of a partial
+        # index. this could fail to extract the predicate correctly on
+        # indexes created like
+        #   CREATE INDEX i ON t (col || ') where') WHERE col <> ''
+        # but as this function does not support expression-based indexes
+        # this case does not occur.
+        partial_pred_re = re.compile(r"\)\s+where\s+(.+)", re.IGNORECASE)
+
+        if schema:
+            schema_expr = "%s." % self.identifier_preparer.quote_identifier(
+                schema
+            )
+        else:
+            schema_expr = ""
+
+        include_auto_indexes = kw.pop("include_auto_indexes", False)
+        for row in pragma_indexes:
+            # ignore implicit primary key index.
+            # https://www.mail-archive.com/sqlite-users@sqlite.org/msg30517.html
+            if not include_auto_indexes and row[1].startswith(
+                "sqlite_autoindex"
+            ):
+                continue
+            indexes.append(
+                dict(
+                    name=row[1],
+                    column_names=[],
+                    unique=row[2],
+                    dialect_options={},
+                )
+            )
+
+            # check partial indexes
+            if len(row) >= 5 and row[4]:
+                s = (
+                    "SELECT sql FROM %(schema)ssqlite_master "
+                    "WHERE name = ? "
+                    "AND type = 'index'" % {"schema": schema_expr}
+                )
+                rs = connection.exec_driver_sql(s, (row[1],))
+                index_sql = rs.scalar()
+                predicate_match = partial_pred_re.search(index_sql)
+                if predicate_match is None:
+                    # unless the regex is broken this case shouldn't happen
+                    # because we know this is a partial index, so the
+                    # definition sql should match the regex
+                    util.warn(
+                        "Failed to look up filter predicate of "
+                        "partial index %s" % row[1]
+                    )
+                else:
+                    predicate = predicate_match.group(1)
+                    indexes[-1]["dialect_options"]["sqlite_where"] = text(
+                        predicate
+                    )
+
+        # loop thru unique indexes to get the column names.
+        for idx in list(indexes):
+            pragma_index = self._get_table_pragma(
+                connection, "index_info", idx["name"], schema=schema
+            )
+
+            for row in pragma_index:
+                if row[2] is None:
+                    util.warn(
+                        "Skipped unsupported reflection of "
+                        "expression-based index %s" % idx["name"]
+                    )
+                    indexes.remove(idx)
+                    break
+                else:
+                    idx["column_names"].append(row[2])
+
+        indexes.sort(key=lambda d: d["name"] or "~")  # sort None as last
+        if indexes:
+            return indexes
+        elif not self.has_table(connection, table_name, schema):
+            raise exc.NoSuchTableError(
+                f"{schema}.{table_name}" if schema else table_name
+            )
+        else:
+            return ReflectionDefaults.indexes()
+
+    def _is_sys_table(self, table_name):
+        return table_name in {
+            "sqlite_schema",
+            "sqlite_master",
+            "sqlite_temp_schema",
+            "sqlite_temp_master",
+        }
+
+    @reflection.cache
+    def _get_table_sql(self, connection, table_name, schema=None, **kw):
+        if schema:
+            schema_expr = "%s." % (
+                self.identifier_preparer.quote_identifier(schema)
+            )
+        else:
+            schema_expr = ""
+        try:
+            s = (
+                "SELECT sql FROM "
+                " (SELECT * FROM %(schema)ssqlite_master UNION ALL "
+                "  SELECT * FROM %(schema)ssqlite_temp_master) "
+                "WHERE name = ? "
+                "AND type in ('table', 'view')" % {"schema": schema_expr}
+            )
+            rs = connection.exec_driver_sql(s, (table_name,))
+        except exc.DBAPIError:
+            s = (
+                "SELECT sql FROM %(schema)ssqlite_master "
+                "WHERE name = ? "
+                "AND type in ('table', 'view')" % {"schema": schema_expr}
+            )
+            rs = connection.exec_driver_sql(s, (table_name,))
+        value = rs.scalar()
+        if value is None and not self._is_sys_table(table_name):
+            raise exc.NoSuchTableError(f"{schema_expr}{table_name}")
+        return value
+
+    def _get_table_pragma(self, connection, pragma, table_name, schema=None):
+        quote = self.identifier_preparer.quote_identifier
+        if schema is not None:
+            statements = [f"PRAGMA {quote(schema)}."]
+        else:
+            # because PRAGMA looks in all attached databases if no schema
+            # given, need to specify "main" schema, however since we want
+            # 'temp' tables in the same namespace as 'main', need to run
+            # the PRAGMA twice
+            statements = ["PRAGMA main.", "PRAGMA temp."]
+
+        qtable = quote(table_name)
+        for statement in statements:
+            statement = f"{statement}{pragma}({qtable})"
+            cursor = connection.exec_driver_sql(statement)
+            if not cursor._soft_closed:
+                # work around SQLite issue whereby cursor.description
+                # is blank when PRAGMA returns no rows:
+                # https://www.sqlite.org/cvstrac/tktview?tn=1884
+                result = cursor.fetchall()
+            else:
+                result = []
+            if result:
+                return result
+        else:
+            return []

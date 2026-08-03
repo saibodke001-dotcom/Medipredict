@@ -1,458 +1,965 @@
-# sql/events.py
+# engine/events.py
 # Copyright (C) 2005-2026 the SQLAlchemy authors and contributors
 # <see AUTHORS file>
 #
 # This module is part of SQLAlchemy and is released under
 # the MIT License: https://www.opensource.org/licenses/mit-license.php
 
+
 from __future__ import annotations
 
+import typing
 from typing import Any
-from typing import TYPE_CHECKING
+from typing import Dict
+from typing import Optional
+from typing import Tuple
+from typing import Type
+from typing import Union
 
-from .base import SchemaEventTarget
+from .base import Connection
+from .base import Engine
+from .interfaces import ConnectionEventsTarget
+from .interfaces import DBAPIConnection
+from .interfaces import DBAPICursor
+from .interfaces import Dialect
 from .. import event
+from .. import exc
+from ..util.typing import Literal
 
-if TYPE_CHECKING:
-    from .schema import Column
-    from .schema import Constraint
-    from .schema import SchemaItem
-    from .schema import Table
-    from ..engine.base import Connection
-    from ..engine.interfaces import ReflectedColumn
-    from ..engine.reflection import Inspector
+if typing.TYPE_CHECKING:
+    from .interfaces import _CoreMultiExecuteParams
+    from .interfaces import _CoreSingleExecuteParams
+    from .interfaces import _DBAPIAnyExecuteParams
+    from .interfaces import _DBAPIMultiExecuteParams
+    from .interfaces import _DBAPISingleExecuteParams
+    from .interfaces import _ExecuteOptions
+    from .interfaces import ExceptionContext
+    from .interfaces import ExecutionContext
+    from .result import Result
+    from ..pool import ConnectionPoolEntry
+    from ..sql import Executable
+    from ..sql.elements import BindParameter
 
 
-class DDLEvents(event.Events[SchemaEventTarget]):
-    """
-    Define event listeners for schema objects,
-    that is, :class:`.SchemaItem` and other :class:`.SchemaEventTarget`
-    subclasses, including :class:`_schema.MetaData`, :class:`_schema.Table`,
-    :class:`_schema.Column`, etc.
+class ConnectionEvents(event.Events[ConnectionEventsTarget]):
+    """Available events for
+    :class:`_engine.Connection` and :class:`_engine.Engine`.
 
-    **Create / Drop Events**
+    The methods here define the name of an event as well as the names of
+    members that are passed to listener functions.
 
-    Events emitted when CREATE and DROP commands are emitted to the database.
-    The event hooks in this category include :meth:`.DDLEvents.before_create`,
-    :meth:`.DDLEvents.after_create`, :meth:`.DDLEvents.before_drop`, and
-    :meth:`.DDLEvents.after_drop`.
+    An event listener can be associated with any
+    :class:`_engine.Connection` or :class:`_engine.Engine`
+    class or instance, such as an :class:`_engine.Engine`, e.g.::
 
-    These events are emitted when using schema-level methods such as
-    :meth:`.MetaData.create_all` and :meth:`.MetaData.drop_all`. Per-object
-    create/drop methods such as :meth:`.Table.create`, :meth:`.Table.drop`,
-    :meth:`.Index.create` are also included, as well as dialect-specific
-    methods such as :meth:`_postgresql.ENUM.create`.
+        from sqlalchemy import event, create_engine
 
-    .. versionadded:: 2.0 :class:`.DDLEvents` event hooks now take place
-       for non-table objects including constraints, indexes, and
-       dialect-specific schema types.
 
-    Event hooks may be attached directly to a :class:`_schema.Table` object or
-    to a :class:`_schema.MetaData` collection, as well as to any
-    :class:`.SchemaItem` class or object that can be individually created and
-    dropped using a distinct SQL command. Such classes include :class:`.Index`,
-    :class:`.Sequence`, and dialect-specific classes such as
-    :class:`_postgresql.ENUM`.
+        def before_cursor_execute(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            log.info("Received statement: %s", statement)
 
-    Example using the :meth:`.DDLEvents.after_create` event, where a custom
-    event hook will emit an ``ALTER TABLE`` command on the current connection,
-    after ``CREATE TABLE`` is emitted::
 
-        from sqlalchemy import create_engine
+        engine = create_engine("postgresql+psycopg2://scott:tiger@localhost/test")
+        event.listen(engine, "before_cursor_execute", before_cursor_execute)
+
+    or with a specific :class:`_engine.Connection`::
+
+        with engine.begin() as conn:
+
+            @event.listens_for(conn, "before_cursor_execute")
+            def before_cursor_execute(
+                conn, cursor, statement, parameters, context, executemany
+            ):
+                log.info("Received statement: %s", statement)
+
+    When the methods are called with a `statement` parameter, such as in
+    :meth:`.after_cursor_execute` or :meth:`.before_cursor_execute`,
+    the statement is the exact SQL string that was prepared for transmission
+    to the DBAPI ``cursor`` in the connection's :class:`.Dialect`.
+
+    The :meth:`.before_execute` and :meth:`.before_cursor_execute`
+    events can also be established with the ``retval=True`` flag, which
+    allows modification of the statement and parameters to be sent
+    to the database.  The :meth:`.before_cursor_execute` event is
+    particularly useful here to add ad-hoc string transformations, such
+    as comments, to all executions::
+
+        from sqlalchemy.engine import Engine
         from sqlalchemy import event
-        from sqlalchemy import Table, Column, Metadata, Integer
-
-        m = MetaData()
-        some_table = Table("some_table", m, Column("data", Integer))
 
 
-        @event.listens_for(some_table, "after_create")
-        def after_create(target, connection, **kw):
-            connection.execute(
-                text("ALTER TABLE %s SET name=foo_%s" % (target.name, target.name))
-            )
+        @event.listens_for(Engine, "before_cursor_execute", retval=True)
+        def comment_sql_calls(
+            conn, cursor, statement, parameters, context, executemany
+        ):
+            statement = statement + " -- some comment"
+            return statement, parameters
 
+    .. note:: :class:`_events.ConnectionEvents` can be established on any
+       combination of :class:`_engine.Engine`, :class:`_engine.Connection`,
+       as well
+       as instances of each of those classes.  Events across all
+       four scopes will fire off for a given instance of
+       :class:`_engine.Connection`.  However, for performance reasons, the
+       :class:`_engine.Connection` object determines at instantiation time
+       whether or not its parent :class:`_engine.Engine` has event listeners
+       established.   Event listeners added to the :class:`_engine.Engine`
+       class or to an instance of :class:`_engine.Engine`
+       *after* the instantiation
+       of a dependent :class:`_engine.Connection` instance will usually
+       *not* be available on that :class:`_engine.Connection` instance.
+       The newly
+       added listeners will instead take effect for
+       :class:`_engine.Connection`
+       instances created subsequent to those event listeners being
+       established on the parent :class:`_engine.Engine` class or instance.
 
-        some_engine = create_engine("postgresql://scott:tiger@host/test")
+    :param retval=False: Applies to the :meth:`.before_execute` and
+      :meth:`.before_cursor_execute` events only.  When True, the
+      user-defined event function must have a return value, which
+      is a tuple of parameters that replace the given statement
+      and parameters.  See those methods for a description of
+      specific return arguments.
 
-        # will emit "CREATE TABLE some_table" as well as the above
-        # "ALTER TABLE" statement afterwards
-        m.create_all(some_engine)
+    """  # noqa
 
-    Constraint objects such as :class:`.ForeignKeyConstraint`,
-    :class:`.UniqueConstraint`, :class:`.CheckConstraint` may also be
-    subscribed to these events, however they will **not** normally produce
-    events as these objects are usually rendered inline within an
-    enclosing ``CREATE TABLE`` statement and implicitly dropped from a
-    ``DROP TABLE`` statement.
+    _target_class_doc = "SomeEngine"
+    _dispatch_target = ConnectionEventsTarget
 
-    For the :class:`.Index` construct, the event hook will be emitted
-    for ``CREATE INDEX``, however SQLAlchemy does not normally emit
-    ``DROP INDEX`` when dropping tables as this is again implicit within the
-    ``DROP TABLE`` statement.
+    @classmethod
+    def _accept_with(
+        cls,
+        target: Union[ConnectionEventsTarget, Type[ConnectionEventsTarget]],
+        identifier: str,
+    ) -> Optional[Union[ConnectionEventsTarget, Type[ConnectionEventsTarget]]]:
+        default_dispatch = super()._accept_with(target, identifier)
+        if default_dispatch is None and hasattr(
+            target, "_no_async_engine_events"
+        ):
+            target._no_async_engine_events()
 
-    .. versionadded:: 2.0 Support for :class:`.SchemaItem` objects
-       for create/drop events was expanded from its previous support for
-       :class:`.MetaData` and :class:`.Table` to also include
-       :class:`.Constraint` and all subclasses, :class:`.Index`,
-       :class:`.Sequence` and some type-related constructs such as
-       :class:`_postgresql.ENUM`.
+        return default_dispatch
 
-    .. note:: These event hooks are only emitted within the scope of
-       SQLAlchemy's create/drop methods; they are not necessarily supported
-       by tools such as `alembic <https://alembic.sqlalchemy.org>`_.
-
-
-    **Attachment Events**
-
-    Attachment events are provided to customize
-    behavior whenever a child schema element is associated
-    with a parent, such as when a :class:`_schema.Column` is associated
-    with its :class:`_schema.Table`, when a
-    :class:`_schema.ForeignKeyConstraint`
-    is associated with a :class:`_schema.Table`, etc.  These events include
-    :meth:`.DDLEvents.before_parent_attach` and
-    :meth:`.DDLEvents.after_parent_attach`.
-
-    **Reflection Events**
-
-    The :meth:`.DDLEvents.column_reflect` event is used to intercept
-    and modify the in-Python definition of database columns when
-    :term:`reflection` of database tables proceeds.
-
-    **Use with Generic DDL**
-
-    DDL events integrate closely with the
-    :class:`.DDL` class and the :class:`.ExecutableDDLElement` hierarchy
-    of DDL clause constructs, which are themselves appropriate
-    as listener callables::
-
-        from sqlalchemy import DDL
-
-        event.listen(
-            some_table,
-            "after_create",
-            DDL("ALTER TABLE %(table)s SET name=foo_%(table)s"),
+    @classmethod
+    def _listen(
+        cls,
+        event_key: event._EventKey[ConnectionEventsTarget],
+        *,
+        retval: bool = False,
+        **kw: Any,
+    ) -> None:
+        target, identifier, fn = (
+            event_key.dispatch_target,
+            event_key.identifier,
+            event_key._listen_fn,
         )
+        target._has_events = True
 
-    **Event Propagation to MetaData Copies**
+        if not retval:
+            if identifier == "before_execute":
+                orig_fn = fn
 
-    For all :class:`.DDLEvent` events, the ``propagate=True`` keyword argument
-    will ensure that a given event handler is propagated to copies of the
-    object, which are made when using the :meth:`_schema.Table.to_metadata`
-    method::
+                def wrap_before_execute(  # type: ignore
+                    conn, clauseelement, multiparams, params, execution_options
+                ):
+                    orig_fn(
+                        conn,
+                        clauseelement,
+                        multiparams,
+                        params,
+                        execution_options,
+                    )
+                    return clauseelement, multiparams, params
 
-        from sqlalchemy import DDL
+                fn = wrap_before_execute
+            elif identifier == "before_cursor_execute":
+                orig_fn = fn
 
-        metadata = MetaData()
-        some_table = Table("some_table", metadata, Column("data", Integer))
+                def wrap_before_cursor_execute(  # type: ignore
+                    conn, cursor, statement, parameters, context, executemany
+                ):
+                    orig_fn(
+                        conn,
+                        cursor,
+                        statement,
+                        parameters,
+                        context,
+                        executemany,
+                    )
+                    return statement, parameters
 
-        event.listen(
-            some_table,
-            "after_create",
-            DDL("ALTER TABLE %(table)s SET name=foo_%(table)s"),
-            propagate=True,
-        )
-
-        new_metadata = MetaData()
-        new_table = some_table.to_metadata(new_metadata)
-
-    The above :class:`.DDL` object will be associated with the
-    :meth:`.DDLEvents.after_create` event for both the ``some_table`` and
-    the ``new_table`` :class:`.Table` objects.
-
-    .. seealso::
-
-        :ref:`event_toplevel`
-
-        :class:`.ExecutableDDLElement`
-
-        :class:`.DDL`
-
-        :ref:`schema_ddl_sequences`
-
-    """  # noqa: E501
-
-    _target_class_doc = "SomeSchemaClassOrObject"
-    _dispatch_target = SchemaEventTarget
-
-    def before_create(
-        self, target: SchemaEventTarget, connection: Connection, **kw: Any
-    ) -> None:
-        r"""Called before CREATE statements are emitted.
-
-        :param target: the :class:`.SchemaObject`, such as a
-         :class:`_schema.MetaData` or :class:`_schema.Table`
-         but also including all create/drop objects such as
-         :class:`.Index`, :class:`.Sequence`, etc.,
-         object which is the target of the event.
-
-         .. versionadded:: 2.0 Support for all :class:`.SchemaItem` objects
-            was added.
-
-        :param connection: the :class:`_engine.Connection` where the
-         CREATE statement or statements will be emitted.
-        :param \**kw: additional keyword arguments relevant
-         to the event.  The contents of this dictionary
-         may vary across releases, and include the
-         list of tables being generated for a metadata-level
-         event, the checkfirst flag, and other
-         elements used by internal events.
-
-        :func:`.event.listen` accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        :func:`.event.listen` accepts the ``insert=True``
-        modifier for this event; when True, the listener function will
-        be prepended to the internal list of events upon discovery, and execute
-        before registered listener functions that do not pass this argument.
-
-        """
-
-    def after_create(
-        self, target: SchemaEventTarget, connection: Connection, **kw: Any
-    ) -> None:
-        r"""Called after CREATE statements are emitted.
-
-        :param target: the :class:`.SchemaObject`, such as a
-         :class:`_schema.MetaData` or :class:`_schema.Table`
-         but also including all create/drop objects such as
-         :class:`.Index`, :class:`.Sequence`, etc.,
-         object which is the target of the event.
-
-         .. versionadded:: 2.0 Support for all :class:`.SchemaItem` objects
-            was added.
-
-        :param connection: the :class:`_engine.Connection` where the
-         CREATE statement or statements have been emitted.
-        :param \**kw: additional keyword arguments relevant
-         to the event.  The contents of this dictionary
-         may vary across releases, and include the
-         list of tables being generated for a metadata-level
-         event, the checkfirst flag, and other
-         elements used by internal events.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        """
-
-    def before_drop(
-        self, target: SchemaEventTarget, connection: Connection, **kw: Any
-    ) -> None:
-        r"""Called before DROP statements are emitted.
-
-        :param target: the :class:`.SchemaObject`, such as a
-         :class:`_schema.MetaData` or :class:`_schema.Table`
-         but also including all create/drop objects such as
-         :class:`.Index`, :class:`.Sequence`, etc.,
-         object which is the target of the event.
-
-         .. versionadded:: 2.0 Support for all :class:`.SchemaItem` objects
-            was added.
-
-        :param connection: the :class:`_engine.Connection` where the
-         DROP statement or statements will be emitted.
-        :param \**kw: additional keyword arguments relevant
-         to the event.  The contents of this dictionary
-         may vary across releases, and include the
-         list of tables being generated for a metadata-level
-         event, the checkfirst flag, and other
-         elements used by internal events.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        """
-
-    def after_drop(
-        self, target: SchemaEventTarget, connection: Connection, **kw: Any
-    ) -> None:
-        r"""Called after DROP statements are emitted.
-
-        :param target: the :class:`.SchemaObject`, such as a
-         :class:`_schema.MetaData` or :class:`_schema.Table`
-         but also including all create/drop objects such as
-         :class:`.Index`, :class:`.Sequence`, etc.,
-         object which is the target of the event.
-
-         .. versionadded:: 2.0 Support for all :class:`.SchemaItem` objects
-            was added.
-
-        :param connection: the :class:`_engine.Connection` where the
-         DROP statement or statements have been emitted.
-        :param \**kw: additional keyword arguments relevant
-         to the event.  The contents of this dictionary
-         may vary across releases, and include the
-         list of tables being generated for a metadata-level
-         event, the checkfirst flag, and other
-         elements used by internal events.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        """
-
-    def before_parent_attach(
-        self, target: SchemaEventTarget, parent: SchemaItem
-    ) -> None:
-        """Called before a :class:`.SchemaItem` is associated with
-        a parent :class:`.SchemaItem`.
-
-        :param target: the target object
-        :param parent: the parent to which the target is being attached.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        """
-
-    def after_parent_attach(
-        self, target: SchemaEventTarget, parent: SchemaItem
-    ) -> None:
-        """Called after a :class:`.SchemaItem` is associated with
-        a parent :class:`.SchemaItem`.
-
-        :param target: the target object
-        :param parent: the parent to which the target is being attached.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
-
-        """
-
-    def _sa_event_column_added_to_pk_constraint(
-        self, const: Constraint, col: Column[Any]
-    ) -> None:
-        """internal event hook used for primary key naming convention
-        updates.
-
-        """
-
-    def column_reflect(
-        self, inspector: Inspector, table: Table, column_info: ReflectedColumn
-    ) -> None:
-        """Called for each unit of 'column info' retrieved when
-        a :class:`_schema.Table` is being reflected.
-
-        This event is most easily used by applying it to a specific
-        :class:`_schema.MetaData` instance, where it will take effect for
-        all :class:`_schema.Table` objects within that
-        :class:`_schema.MetaData` that undergo reflection::
-
-            metadata = MetaData()
-
-
-            @event.listens_for(metadata, "column_reflect")
-            def receive_column_reflect(inspector, table, column_info):
-                # receives for all Table objects that are reflected
-                # under this MetaData
-                ...
-
-
-            # will use the above event hook
-            my_table = Table("my_table", metadata, autoload_with=some_engine)
-
-        .. versionadded:: 1.4.0b2 The :meth:`_events.DDLEvents.column_reflect`
-           hook may now be applied to a :class:`_schema.MetaData` object as
-           well as the :class:`_schema.MetaData` class itself where it will
-           take place for all :class:`_schema.Table` objects associated with
-           the targeted :class:`_schema.MetaData`.
-
-        It may also be applied to the :class:`_schema.Table` class across
-        the board::
-
-            from sqlalchemy import Table
-
-
-            @event.listens_for(Table, "column_reflect")
-            def receive_column_reflect(inspector, table, column_info):
-                # receives for all Table objects that are reflected
-                ...
-
-        It can also be applied to a specific :class:`_schema.Table` at the
-        point that one is being reflected using the
-        :paramref:`_schema.Table.listeners` parameter::
-
-            t1 = Table(
-                "my_table",
-                autoload_with=some_engine,
-                listeners=[("column_reflect", receive_column_reflect)],
+                fn = wrap_before_cursor_execute
+        elif retval and identifier not in (
+            "before_execute",
+            "before_cursor_execute",
+        ):
+            raise exc.ArgumentError(
+                "Only the 'before_execute', "
+                "'before_cursor_execute' and 'handle_error' engine "
+                "event listeners accept the 'retval=True' "
+                "argument."
             )
+        event_key.with_wrapper(fn).base_listen()
 
-        The dictionary of column information as returned by the
-        dialect is passed, and can be modified.  The dictionary
-        is that returned in each element of the list returned
-        by :meth:`.reflection.Inspector.get_columns`:
+    @event._legacy_signature(
+        "1.4",
+        ["conn", "clauseelement", "multiparams", "params"],
+        lambda conn, clauseelement, multiparams, params, execution_options: (
+            conn,
+            clauseelement,
+            multiparams,
+            params,
+        ),
+    )
+    def before_execute(
+        self,
+        conn: Connection,
+        clauseelement: Executable,
+        multiparams: _CoreMultiExecuteParams,
+        params: _CoreSingleExecuteParams,
+        execution_options: _ExecuteOptions,
+    ) -> Optional[
+        Tuple[Executable, _CoreMultiExecuteParams, _CoreSingleExecuteParams]
+    ]:
+        """Intercept high level execute() events, receiving uncompiled
+        SQL constructs and other objects prior to rendering into SQL.
 
-            * ``name`` - the column's name, is applied to the
-              :paramref:`_schema.Column.name` parameter
+        This event is good for debugging SQL compilation issues as well
+        as early manipulation of the parameters being sent to the database,
+        as the parameter lists will be in a consistent format here.
 
-            * ``type`` - the type of this column, which should be an instance
-              of :class:`~sqlalchemy.types.TypeEngine`, is applied to the
-              :paramref:`_schema.Column.type` parameter
+        This event can be optionally established with the ``retval=True``
+        flag.  The ``clauseelement``, ``multiparams``, and ``params``
+        arguments should be returned as a three-tuple in this case::
 
-            * ``nullable`` - boolean flag if the column is NULL or NOT NULL,
-              is applied to the :paramref:`_schema.Column.nullable` parameter
+            @event.listens_for(Engine, "before_execute", retval=True)
+            def before_execute(conn, clauseelement, multiparams, params):
+                # do something with clauseelement, multiparams, params
+                return clauseelement, multiparams, params
 
-            * ``default`` - the column's server default value.  This is
-              normally specified as a plain string SQL expression, however the
-              event can pass a :class:`.FetchedValue`, :class:`.DefaultClause`,
-              or :func:`_expression.text` object as well.  Is applied to the
-              :paramref:`_schema.Column.server_default` parameter
+        :param conn: :class:`_engine.Connection` object
+        :param clauseelement: SQL expression construct, :class:`.Compiled`
+         instance, or string statement passed to
+         :meth:`_engine.Connection.execute`.
+        :param multiparams: Multiple parameter sets, a list of dictionaries.
+        :param params: Single parameter set, a single dictionary.
+        :param execution_options: dictionary of execution
+         options passed along with the statement, if any.  This is a merge
+         of all options that will be used, including those of the statement,
+         the connection, and those passed in to the method itself for
+         the 2.0 style of execution.
 
-        The event is called before any action is taken against
-        this dictionary, and the contents can be modified; the following
-        additional keys may be added to the dictionary to further modify
-        how the :class:`_schema.Column` is constructed:
-
-
-            * ``key`` - the string key that will be used to access this
-              :class:`_schema.Column` in the ``.c`` collection; will be applied
-              to the :paramref:`_schema.Column.key` parameter. Is also used
-              for ORM mapping.  See the section
-              :ref:`mapper_automated_reflection_schemes` for an example.
-
-            * ``quote`` - force or un-force quoting on the column name;
-              is applied to the :paramref:`_schema.Column.quote` parameter.
-
-            * ``info`` - a dictionary of arbitrary data to follow along with
-              the :class:`_schema.Column`, is applied to the
-              :paramref:`_schema.Column.info` parameter.
-
-        :func:`.event.listen` also accepts the ``propagate=True``
-        modifier for this event; when True, the listener function will
-        be established for any copies made of the target object,
-        i.e. those copies that are generated when
-        :meth:`_schema.Table.to_metadata` is used.
+         .. versionadded: 1.4
 
         .. seealso::
 
-            :ref:`mapper_automated_reflection_schemes` -
-            in the ORM mapping documentation
-
-            :ref:`automap_intercepting_columns` -
-            in the :ref:`automap_toplevel` documentation
-
-            :ref:`metadata_reflection_dbagnostic_types` - in
-            the :ref:`metadata_reflection_toplevel` documentation
+            :meth:`.before_cursor_execute`
 
         """
+
+    @event._legacy_signature(
+        "1.4",
+        ["conn", "clauseelement", "multiparams", "params", "result"],
+        lambda conn, clauseelement, multiparams, params, execution_options, result: (  # noqa
+            conn,
+            clauseelement,
+            multiparams,
+            params,
+            result,
+        ),
+    )
+    def after_execute(
+        self,
+        conn: Connection,
+        clauseelement: Executable,
+        multiparams: _CoreMultiExecuteParams,
+        params: _CoreSingleExecuteParams,
+        execution_options: _ExecuteOptions,
+        result: Result[Any],
+    ) -> None:
+        """Intercept high level execute() events after execute.
+
+
+        :param conn: :class:`_engine.Connection` object
+        :param clauseelement: SQL expression construct, :class:`.Compiled`
+         instance, or string statement passed to
+         :meth:`_engine.Connection.execute`.
+        :param multiparams: Multiple parameter sets, a list of dictionaries.
+        :param params: Single parameter set, a single dictionary.
+        :param execution_options: dictionary of execution
+         options passed along with the statement, if any.  This is a merge
+         of all options that will be used, including those of the statement,
+         the connection, and those passed in to the method itself for
+         the 2.0 style of execution.
+
+         .. versionadded: 1.4
+
+        :param result: :class:`_engine.CursorResult` generated by the
+         execution.
+
+        """
+
+    def before_cursor_execute(
+        self,
+        conn: Connection,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: _DBAPIAnyExecuteParams,
+        context: Optional[ExecutionContext],
+        executemany: bool,
+    ) -> Optional[Tuple[str, _DBAPIAnyExecuteParams]]:
+        """Intercept low-level cursor execute() events before execution,
+        receiving the string SQL statement and DBAPI-specific parameter list to
+        be invoked against a cursor.
+
+        This event is a good choice for logging as well as late modifications
+        to the SQL string.  It's less ideal for parameter modifications except
+        for those which are specific to a target backend.
+
+        This event can be optionally established with the ``retval=True``
+        flag.  The ``statement`` and ``parameters`` arguments should be
+        returned as a two-tuple in this case::
+
+            @event.listens_for(Engine, "before_cursor_execute", retval=True)
+            def before_cursor_execute(
+                conn, cursor, statement, parameters, context, executemany
+            ):
+                # do something with statement, parameters
+                return statement, parameters
+
+        See the example at :class:`_events.ConnectionEvents`.
+
+        :param conn: :class:`_engine.Connection` object
+        :param cursor: DBAPI cursor object
+        :param statement: string SQL statement, as to be passed to the DBAPI
+        :param parameters: Dictionary, tuple, or list of parameters being
+         passed to the ``execute()`` or ``executemany()`` method of the
+         DBAPI ``cursor``.  In some cases may be ``None``.
+        :param context: :class:`.ExecutionContext` object in use.  May
+         be ``None``.
+        :param executemany: boolean, if ``True``, this is an ``executemany()``
+         call, if ``False``, this is an ``execute()`` call.
+
+        .. seealso::
+
+            :meth:`.before_execute`
+
+            :meth:`.after_cursor_execute`
+
+        """
+
+    def after_cursor_execute(
+        self,
+        conn: Connection,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: _DBAPIAnyExecuteParams,
+        context: Optional[ExecutionContext],
+        executemany: bool,
+    ) -> None:
+        """Intercept low-level cursor execute() events after execution.
+
+        :param conn: :class:`_engine.Connection` object
+        :param cursor: DBAPI cursor object.  Will have results pending
+         if the statement was a SELECT, but these should not be consumed
+         as they will be needed by the :class:`_engine.CursorResult`.
+        :param statement: string SQL statement, as passed to the DBAPI
+        :param parameters: Dictionary, tuple, or list of parameters being
+         passed to the ``execute()`` or ``executemany()`` method of the
+         DBAPI ``cursor``.  In some cases may be ``None``.
+        :param context: :class:`.ExecutionContext` object in use.  May
+         be ``None``.
+        :param executemany: boolean, if ``True``, this is an ``executemany()``
+         call, if ``False``, this is an ``execute()`` call.
+
+        """
+
+    @event._legacy_signature(
+        "2.0", ["conn", "branch"], converter=lambda conn: (conn, False)
+    )
+    def engine_connect(self, conn: Connection) -> None:
+        """Intercept the creation of a new :class:`_engine.Connection`.
+
+        This event is called typically as the direct result of calling
+        the :meth:`_engine.Engine.connect` method.
+
+        It differs from the :meth:`_events.PoolEvents.connect` method, which
+        refers to the actual connection to a database at the DBAPI level;
+        a DBAPI connection may be pooled and reused for many operations.
+        In contrast, this event refers only to the production of a higher level
+        :class:`_engine.Connection` wrapper around such a DBAPI connection.
+
+        It also differs from the :meth:`_events.PoolEvents.checkout` event
+        in that it is specific to the :class:`_engine.Connection` object,
+        not the
+        DBAPI connection that :meth:`_events.PoolEvents.checkout` deals with,
+        although
+        this DBAPI connection is available here via the
+        :attr:`_engine.Connection.connection` attribute.
+        But note there can in fact
+        be multiple :meth:`_events.PoolEvents.checkout`
+        events within the lifespan
+        of a single :class:`_engine.Connection` object, if that
+        :class:`_engine.Connection`
+        is invalidated and re-established.
+
+        :param conn: :class:`_engine.Connection` object.
+
+        .. seealso::
+
+            :meth:`_events.PoolEvents.checkout`
+            the lower-level pool checkout event
+            for an individual DBAPI connection
+
+        """
+
+    def set_connection_execution_options(
+        self, conn: Connection, opts: Dict[str, Any]
+    ) -> None:
+        """Intercept when the :meth:`_engine.Connection.execution_options`
+        method is called.
+
+        This method is called after the new :class:`_engine.Connection`
+        has been
+        produced, with the newly updated execution options collection, but
+        before the :class:`.Dialect` has acted upon any of those new options.
+
+        Note that this method is not called when a new
+        :class:`_engine.Connection`
+        is produced which is inheriting execution options from its parent
+        :class:`_engine.Engine`; to intercept this condition, use the
+        :meth:`_events.ConnectionEvents.engine_connect` event.
+
+        :param conn: The newly copied :class:`_engine.Connection` object
+
+        :param opts: dictionary of options that were passed to the
+         :meth:`_engine.Connection.execution_options` method.
+         This dictionary may be modified in place to affect the ultimate
+         options which take effect.
+
+         .. versionadded:: 2.0 the ``opts`` dictionary may be modified
+            in place.
+
+
+        .. seealso::
+
+            :meth:`_events.ConnectionEvents.set_engine_execution_options`
+            - event
+            which is called when :meth:`_engine.Engine.execution_options`
+            is called.
+
+
+        """
+
+    def set_engine_execution_options(
+        self, engine: Engine, opts: Dict[str, Any]
+    ) -> None:
+        """Intercept when the :meth:`_engine.Engine.execution_options`
+        method is called.
+
+        The :meth:`_engine.Engine.execution_options` method produces a shallow
+        copy of the :class:`_engine.Engine` which stores the new options.
+        That new
+        :class:`_engine.Engine` is passed here.
+        A particular application of this
+        method is to add a :meth:`_events.ConnectionEvents.engine_connect`
+        event
+        handler to the given :class:`_engine.Engine`
+        which will perform some per-
+        :class:`_engine.Connection` task specific to these execution options.
+
+        :param conn: The newly copied :class:`_engine.Engine` object
+
+        :param opts: dictionary of options that were passed to the
+         :meth:`_engine.Connection.execution_options` method.
+         This dictionary may be modified in place to affect the ultimate
+         options which take effect.
+
+         .. versionadded:: 2.0 the ``opts`` dictionary may be modified
+            in place.
+
+        .. seealso::
+
+            :meth:`_events.ConnectionEvents.set_connection_execution_options`
+            - event
+            which is called when :meth:`_engine.Connection.execution_options`
+            is
+            called.
+
+        """
+
+    def engine_disposed(self, engine: Engine) -> None:
+        """Intercept when the :meth:`_engine.Engine.dispose` method is called.
+
+        The :meth:`_engine.Engine.dispose` method instructs the engine to
+        "dispose" of it's connection pool (e.g. :class:`_pool.Pool`), and
+        replaces it with a new one.  Disposing of the old pool has the
+        effect that existing checked-in connections are closed.  The new
+        pool does not establish any new connections until it is first used.
+
+        This event can be used to indicate that resources related to the
+        :class:`_engine.Engine` should also be cleaned up,
+        keeping in mind that the
+        :class:`_engine.Engine`
+        can still be used for new requests in which case
+        it re-acquires connection resources.
+
+        """
+
+    def begin(self, conn: Connection) -> None:
+        """Intercept begin() events.
+
+        :param conn: :class:`_engine.Connection` object
+
+        """
+
+    def rollback(self, conn: Connection) -> None:
+        """Intercept rollback() events, as initiated by a
+        :class:`.Transaction`.
+
+        Note that the :class:`_pool.Pool` also "auto-rolls back"
+        a DBAPI connection upon checkin, if the ``reset_on_return``
+        flag is set to its default value of ``'rollback'``.
+        To intercept this
+        rollback, use the :meth:`_events.PoolEvents.reset` hook.
+
+        :param conn: :class:`_engine.Connection` object
+
+        .. seealso::
+
+            :meth:`_events.PoolEvents.reset`
+
+        """
+
+    def commit(self, conn: Connection) -> None:
+        """Intercept commit() events, as initiated by a
+        :class:`.Transaction`.
+
+        Note that the :class:`_pool.Pool` may also "auto-commit"
+        a DBAPI connection upon checkin, if the ``reset_on_return``
+        flag is set to the value ``'commit'``.  To intercept this
+        commit, use the :meth:`_events.PoolEvents.reset` hook.
+
+        :param conn: :class:`_engine.Connection` object
+        """
+
+    def savepoint(self, conn: Connection, name: str) -> None:
+        """Intercept savepoint() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param name: specified name used for the savepoint.
+
+        """
+
+    def rollback_savepoint(
+        self, conn: Connection, name: str, context: None
+    ) -> None:
+        """Intercept rollback_savepoint() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param name: specified name used for the savepoint.
+        :param context: not used
+
+        """
+        # TODO: deprecate "context"
+
+    def release_savepoint(
+        self, conn: Connection, name: str, context: None
+    ) -> None:
+        """Intercept release_savepoint() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param name: specified name used for the savepoint.
+        :param context: not used
+
+        """
+        # TODO: deprecate "context"
+
+    def begin_twophase(self, conn: Connection, xid: Any) -> None:
+        """Intercept begin_twophase() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param xid: two-phase XID identifier
+
+        """
+
+    def prepare_twophase(self, conn: Connection, xid: Any) -> None:
+        """Intercept prepare_twophase() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param xid: two-phase XID identifier
+        """
+
+    def rollback_twophase(
+        self, conn: Connection, xid: Any, is_prepared: bool
+    ) -> None:
+        """Intercept rollback_twophase() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param xid: two-phase XID identifier
+        :param is_prepared: boolean, indicates if
+         :meth:`.TwoPhaseTransaction.prepare` was called.
+
+        """
+
+    def commit_twophase(
+        self, conn: Connection, xid: Any, is_prepared: bool
+    ) -> None:
+        """Intercept commit_twophase() events.
+
+        :param conn: :class:`_engine.Connection` object
+        :param xid: two-phase XID identifier
+        :param is_prepared: boolean, indicates if
+         :meth:`.TwoPhaseTransaction.prepare` was called.
+
+        """
+
+
+class DialectEvents(event.Events[Dialect]):
+    """event interface for execution-replacement functions.
+
+    These events allow direct instrumentation and replacement
+    of key dialect functions which interact with the DBAPI.
+
+    .. note::
+
+        :class:`.DialectEvents` hooks should be considered **semi-public**
+        and experimental.
+        These hooks are not for general use and are only for those situations
+        where intricate re-statement of DBAPI mechanics must be injected onto
+        an existing dialect.  For general-use statement-interception events,
+        please use the :class:`_events.ConnectionEvents` interface.
+
+    .. seealso::
+
+        :meth:`_events.ConnectionEvents.before_cursor_execute`
+
+        :meth:`_events.ConnectionEvents.before_execute`
+
+        :meth:`_events.ConnectionEvents.after_cursor_execute`
+
+        :meth:`_events.ConnectionEvents.after_execute`
+
+    """
+
+    _target_class_doc = "SomeEngine"
+    _dispatch_target = Dialect
+
+    @classmethod
+    def _listen(
+        cls,
+        event_key: event._EventKey[Dialect],
+        *,
+        retval: bool = False,
+        **kw: Any,
+    ) -> None:
+        target = event_key.dispatch_target
+
+        target._has_events = True
+        event_key.base_listen()
+
+    @classmethod
+    def _accept_with(
+        cls,
+        target: Union[Engine, Type[Engine], Dialect, Type[Dialect]],
+        identifier: str,
+    ) -> Optional[Union[Dialect, Type[Dialect]]]:
+        if isinstance(target, type):
+            if issubclass(target, Engine):
+                return Dialect
+            elif issubclass(target, Dialect):
+                return target
+        elif isinstance(target, Engine):
+            return target.dialect
+        elif isinstance(target, Dialect):
+            return target
+        elif isinstance(target, Connection) and identifier == "handle_error":
+            raise exc.InvalidRequestError(
+                "The handle_error() event hook as of SQLAlchemy 2.0 is "
+                "established on the Dialect, and may only be applied to the "
+                "Engine as a whole or to a specific Dialect as a whole, "
+                "not on a per-Connection basis."
+            )
+        elif hasattr(target, "_no_async_engine_events"):
+            target._no_async_engine_events()
+        else:
+            return None
+
+    def handle_error(
+        self, exception_context: ExceptionContext
+    ) -> Optional[BaseException]:
+        r"""Intercept all exceptions processed by the
+        :class:`_engine.Dialect`, typically but not limited to those
+        emitted within the scope of a :class:`_engine.Connection`.
+
+        .. versionchanged:: 2.0 the :meth:`.DialectEvents.handle_error` event
+           is moved to the :class:`.DialectEvents` class, moved from the
+           :class:`.ConnectionEvents` class, so that it may also participate in
+           the "pre ping" operation configured with the
+           :paramref:`_sa.create_engine.pool_pre_ping` parameter. The event
+           remains registered by using the :class:`_engine.Engine` as the event
+           target, however note that using the :class:`_engine.Connection` as
+           an event target for :meth:`.DialectEvents.handle_error` is no longer
+           supported.
+
+        This includes all exceptions emitted by the DBAPI as well as
+        within SQLAlchemy's statement invocation process, including
+        encoding errors and other statement validation errors.  Other areas
+        in which the event is invoked include transaction begin and end,
+        result row fetching, cursor creation.
+
+        Note that :meth:`.handle_error` may support new kinds of exceptions
+        and new calling scenarios at *any time*.  Code which uses this
+        event must expect new calling patterns to be present in minor
+        releases.
+
+        To support the wide variety of members that correspond to an exception,
+        as well as to allow extensibility of the event without backwards
+        incompatibility, the sole argument received is an instance of
+        :class:`.ExceptionContext`.   This object contains data members
+        representing detail about the exception.
+
+        Use cases supported by this hook include:
+
+        * read-only, low-level exception handling for logging and
+          debugging purposes
+        * Establishing whether a DBAPI connection error message indicates
+          that the database connection needs to be reconnected, including
+          for the "pre_ping" handler used by **some** dialects
+        * Establishing or disabling whether a connection or the owning
+          connection pool is invalidated or expired in response to a
+          specific exception
+        * exception re-writing
+
+        The hook is called while the cursor from the failed operation
+        (if any) is still open and accessible.   Special cleanup operations
+        can be called on this cursor; SQLAlchemy will attempt to close
+        this cursor subsequent to this hook being invoked.
+
+        As of SQLAlchemy 2.0, the "pre_ping" handler enabled using the
+        :paramref:`_sa.create_engine.pool_pre_ping` parameter will also
+        participate in the :meth:`.handle_error` process, **for those dialects
+        that rely upon disconnect codes to detect database liveness**. Note
+        that some dialects such as psycopg, psycopg2, and most MySQL dialects
+        make use of a native ``ping()`` method supplied by the DBAPI which does
+        not make use of disconnect codes.
+
+        .. versionchanged:: 2.0.0 The :meth:`.DialectEvents.handle_error`
+           event hook participates in connection pool "pre-ping" operations.
+           Within this usage, the :attr:`.ExceptionContext.engine` attribute
+           will be ``None``, however the :class:`.Dialect` in use is always
+           available via the :attr:`.ExceptionContext.dialect` attribute.
+
+        .. versionchanged:: 2.0.5 Added :attr:`.ExceptionContext.is_pre_ping`
+           attribute which will be set to ``True`` when the
+           :meth:`.DialectEvents.handle_error` event hook is triggered within
+           a connection pool pre-ping operation.
+
+        .. versionchanged:: 2.0.5 An issue was repaired that allows for the
+           PostgreSQL ``psycopg`` and ``psycopg2`` drivers, as well as all
+           MySQL drivers, to properly participate in the
+           :meth:`.DialectEvents.handle_error` event hook during
+           connection pool "pre-ping" operations; previously, the
+           implementation was non-working for these drivers.
+
+
+        A handler function has two options for replacing
+        the SQLAlchemy-constructed exception into one that is user
+        defined.   It can either raise this new exception directly, in
+        which case all further event listeners are bypassed and the
+        exception will be raised, after appropriate cleanup as taken
+        place::
+
+            @event.listens_for(Engine, "handle_error")
+            def handle_exception(context):
+                if isinstance(
+                    context.original_exception, psycopg2.OperationalError
+                ) and "failed" in str(context.original_exception):
+                    raise MySpecialException("failed operation")
+
+        .. warning::  Because the
+           :meth:`_events.DialectEvents.handle_error`
+           event specifically provides for exceptions to be re-thrown as
+           the ultimate exception raised by the failed statement,
+           **stack traces will be misleading** if the user-defined event
+           handler itself fails and throws an unexpected exception;
+           the stack trace may not illustrate the actual code line that
+           failed!  It is advised to code carefully here and use
+           logging and/or inline debugging if unexpected exceptions are
+           occurring.
+
+        Alternatively, a "chained" style of event handling can be
+        used, by configuring the handler with the ``retval=True``
+        modifier and returning the new exception instance from the
+        function.  In this case, event handling will continue onto the
+        next handler.   The "chained" exception is available using
+        :attr:`.ExceptionContext.chained_exception`::
+
+            @event.listens_for(Engine, "handle_error", retval=True)
+            def handle_exception(context):
+                if (
+                    context.chained_exception is not None
+                    and "special" in context.chained_exception.message
+                ):
+                    return MySpecialException(
+                        "failed", cause=context.chained_exception
+                    )
+
+        Handlers that return ``None`` may be used within the chain; when
+        a handler returns ``None``, the previous exception instance,
+        if any, is maintained as the current exception that is passed onto the
+        next handler.
+
+        When a custom exception is raised or returned, SQLAlchemy raises
+        this new exception as-is, it is not wrapped by any SQLAlchemy
+        object.  If the exception is not a subclass of
+        :class:`sqlalchemy.exc.StatementError`,
+        certain features may not be available; currently this includes
+        the ORM's feature of adding a detail hint about "autoflush" to
+        exceptions raised within the autoflush process.
+
+        :param context: an :class:`.ExceptionContext` object.  See this
+         class for details on all available members.
+
+
+        .. seealso::
+
+            :ref:`pool_new_disconnect_codes`
+
+        """
+
+    def do_connect(
+        self,
+        dialect: Dialect,
+        conn_rec: ConnectionPoolEntry,
+        cargs: Tuple[Any, ...],
+        cparams: Dict[str, Any],
+    ) -> Optional[DBAPIConnection]:
+        """Receive connection arguments before a connection is made.
+
+        This event is useful in that it allows the handler to manipulate the
+        cargs and/or cparams collections that control how the DBAPI
+        ``connect()`` function will be called. ``cargs`` will always be a
+        Python list that can be mutated in-place, and ``cparams`` a Python
+        dictionary that may also be mutated::
+
+            e = create_engine("postgresql+psycopg2://user@host/dbname")
+
+
+            @event.listens_for(e, "do_connect")
+            def receive_do_connect(dialect, conn_rec, cargs, cparams):
+                cparams["password"] = "some_password"
+
+        The event hook may also be used to override the call to ``connect()``
+        entirely, by returning a non-``None`` DBAPI connection object::
+
+            e = create_engine("postgresql+psycopg2://user@host/dbname")
+
+
+            @event.listens_for(e, "do_connect")
+            def receive_do_connect(dialect, conn_rec, cargs, cparams):
+                return psycopg2.connect(*cargs, **cparams)
+
+        .. seealso::
+
+            :ref:`custom_dbapi_args`
+
+        """
+
+    def do_executemany(
+        self,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: _DBAPIMultiExecuteParams,
+        context: ExecutionContext,
+    ) -> Optional[Literal[True]]:
+        """Receive a cursor to have executemany() called.
+
+        Return the value True to halt further events from invoking,
+        and to indicate that the cursor execution has already taken
+        place within the event handler.
+
+        """
+
+    def do_execute_no_params(
+        self, cursor: DBAPICursor, statement: str, context: ExecutionContext
+    ) -> Optional[Literal[True]]:
+        """Receive a cursor to have execute() with no parameters called.
+
+        Return the value True to halt further events from invoking,
+        and to indicate that the cursor execution has already taken
+        place within the event handler.
+
+        """
+
+    def do_execute(
+        self,
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: _DBAPISingleExecuteParams,
+        context: ExecutionContext,
+    ) -> Optional[Literal[True]]:
+        """Receive a cursor to have execute() called.
+
+        Return the value True to halt further events from invoking,
+        and to indicate that the cursor execution has already taken
+        place within the event handler.
+
+        """
+
+    def do_setinputsizes(
+        self,
+        inputsizes: Dict[BindParameter[Any], Any],
+        cursor: DBAPICursor,
+        statement: str,
+        parameters: _DBAPIAnyExecuteParams,
+        context: ExecutionContext,
+    ) -> None:
+        """Receive the setinputsizes dictionary for possible modification.
+
+        This event is emitted in the case where the dialect makes use of the
+        DBAPI ``cursor.setinputsizes()`` method which passes information about
+        parameter binding for a particular statement.   The given
+        ``inputsizes`` dictionary will contain :class:`.BindParameter` objects
+        as keys, linked to DBAPI-specific type objects as values; for
+        parameters that are not bound, they are added to the dictionary with
+        ``None`` as the value, which means the parameter will not be included
+        in the ultimate setinputsizes call.   The event may be used to inspect
+        and/or log the datatypes that are being bound, as well as to modify the
+        dictionary in place.  Parameters can be added, modified, or removed
+        from this dictionary.   Callers will typically want to inspect the
+        :attr:`.BindParameter.type` attribute of the given bind objects in
+        order to make decisions about the DBAPI object.
+
+        After the event, the ``inputsizes`` dictionary is converted into
+        an appropriate datastructure to be passed to ``cursor.setinputsizes``;
+        either a list for a positional bound parameter execution style,
+        or a dictionary of string parameter keys to DBAPI type objects for
+        a named bound parameter execution style.
+
+        The setinputsizes hook overall is only used for dialects which include
+        the flag ``use_setinputsizes=True``.  Dialects which use this
+        include python-oracledb, cx_Oracle, pg8000, asyncpg, and pyodbc
+        dialects.
+
+        .. note::
+
+            For use with pyodbc, the ``use_setinputsizes`` flag
+            must be passed to the dialect, e.g.::
+
+                create_engine("mssql+pyodbc://...", use_setinputsizes=True)
+
+            .. seealso::
+
+                  :ref:`mssql_pyodbc_setinputsizes`
+
+        .. versionadded:: 1.2.9
+
+        .. seealso::
+
+            :ref:`cx_oracle_setinputsizes`
+
+        """
+        pass
